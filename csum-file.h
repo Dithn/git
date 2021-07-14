@@ -16,7 +16,9 @@ struct hashfile {
 	const char *name;
 	int do_crc;
 	uint32_t crc32;
-	unsigned char buffer[8192];
+	size_t buffer_len;
+	unsigned char *buffer;
+	unsigned char *check_buffer;
 };
 
 /* Checkpoint */
@@ -60,6 +62,13 @@ static inline void hashwrite_be32(struct hashfile *f, uint32_t data)
 {
 	data = htonl(data);
 	hashwrite(f, &data, sizeof(data));
+}
+
+static inline size_t hashwrite_be64(struct hashfile *f, uint64_t data)
+{
+	data = htonll(data);
+	hashwrite(f, &data, sizeof(data));
+	return sizeof(data);
 }
 
 #endif

@@ -150,7 +150,7 @@ test_expect_success 'checkout -b to @{-1} fails with the right branch name' '
 	git checkout branch2 &&
 	echo  >expect "fatal: A branch named '\''branch1'\'' already exists." &&
 	test_must_fail git checkout -b @{-1} 2>actual &&
-	test_i18ncmp expect actual
+	test_cmp expect actual
 '
 
 test_expect_success 'checkout -B to an existing branch resets branch to HEAD' '
@@ -258,6 +258,16 @@ test_expect_success 'checkout -b to a new branch preserves mergeable changes des
 	echo file1 >expect &&
 	git diff --name-only >actual &&
 	test_cmp expect actual
+'
+
+test_expect_success 'checkout -b rejects an invalid start point' '
+	test_must_fail git checkout -b branch4 file1 2>err &&
+	test_i18ngrep "is not a commit" err
+'
+
+test_expect_success 'checkout -b rejects an extra path argument' '
+	test_must_fail git checkout -b branch5 branch1 file1 2>err &&
+	test_i18ngrep "Cannot update paths and switch to branch" err
 '
 
 test_done
