@@ -1,33 +1,46 @@
 #include "builtin.h"
+#include "commit.h"
 #include "config.h"
-#include "dir.h"
-#include "lockfile.h"
+#include "environment.h"
+#include "gettext.h"
+#include "hex.h"
 #include "parse-options.h"
-#include "repository.h"
 #include "commit-graph.h"
-#include "object-store.h"
+#include "odb.h"
+#include "odb/source.h"
+#include "odb/source-files.h"
+#include "progress.h"
+#include "replace-object.h"
+#include "strbuf.h"
+#include "tag.h"
+#include "trace2.h"
 
-static char const * const builtin_commit_graph_usage[] = {
-	N_("git commit-graph verify [--object-dir <objdir>] [--shallow] [--[no-]progress]"),
-	N_("git commit-graph write [--object-dir <objdir>] [--append] "
-	   "[--split[=<strategy>]] [--reachable|--stdin-packs|--stdin-commits] "
-	   "[--changed-paths] [--[no-]progress] <split options>"),
-	NULL
-};
+#define BUILTIN_COMMIT_GRAPH_VERIFY_USAGE \
+	N_("git commit-graph verify [--object-dir <dir>] [--shallow] [--[no-]progress]")
+
+#define BUILTIN_COMMIT_GRAPH_WRITE_USAGE \
+	N_("git commit-graph write [--object-dir <dir>] [--append]\n" \
+	   "                       [--split[=<strategy>]] [--reachable | --stdin-packs | --stdin-commits]\n" \
+	   "                       [--changed-paths] [--[no-]max-new-filters <n>] [--[no-]progress]\n" \
+	   "                       <split-options>")
 
 static const char * const builtin_commit_graph_verify_usage[] = {
-	N_("git commit-graph verify [--object-dir <objdir>] [--shallow] [--[no-]progress]"),
+	BUILTIN_COMMIT_GRAPH_VERIFY_USAGE,
 	NULL
 };
 
 static const char * const builtin_commit_graph_write_usage[] = {
-	N_("git commit-graph write [--object-dir <objdir>] [--append] "
-	   "[--split[=<strategy>]] [--reachable|--stdin-packs|--stdin-commits] "
-	   "[--changed-paths] [--[no-]progress] <split options>"),
+	BUILTIN_COMMIT_GRAPH_WRITE_USAGE,
 	NULL
 };
 
-static struct opts_commit_graph {
+static char const * const builtin_commit_graph_usage[] = {
+	BUILTIN_COMMIT_GRAPH_VERIFY_USAGE,
+	BUILTIN_COMMIT_GRAPH_WRITE_USAGE,
+	NULL,
+};
+
+struct opts_commit_graph {
 	const char *obj_dir;
 	int reachable;
 	int stdin_packs;
@@ -37,120 +50,205 @@ static struct opts_commit_graph {
 	int shallow;
 	int progress;
 	int enable_changed_paths;
-} opts;
+};
 
-static struct object_directory *find_odb(struct repository *r,
-					 const char *obj_dir)
+#define COMMIT_GRAPH_COMMON_OPTIONS(opts) \
+	OPT_STRING(0, "object-dir", &(opts)->obj_dir, \
+		   N_("dir"), \
+		   N_("the object directory to store the graph"))
+
+static int cmd_commit_graph_verify(int argc,
+				   const char **argv,
+				   const char *prefix,
+				   struct repository *repo)
 {
-	struct object_directory *odb;
-	char *obj_dir_real = real_pathdup(obj_dir, 1);
-	struct strbuf odb_path_real = STRBUF_INIT;
-
-	prepare_alt_odb(r);
-	for (odb = r->objects->odb; odb; odb = odb->next) {
-		strbuf_realpath(&odb_path_real, odb->path, 1);
-		if (!strcmp(obj_dir_real, odb_path_real.buf))
-			break;
-	}
-
-	free(obj_dir_real);
-	strbuf_release(&odb_path_real);
-
-	if (!odb)
-		die(_("could not find object directory matching %s"), obj_dir);
-	return odb;
-}
-
-static int graph_verify(int argc, const char **argv)
-{
+	struct opts_commit_graph opts = {
+		.progress = isatty(2),
+	};
 	struct commit_graph *graph = NULL;
-	struct object_directory *odb = NULL;
+	struct odb_files_dir *dir = NULL;
 	char *graph_name;
-	int open_ok;
+	char *chain_name;
+	enum { OPENED_NONE, OPENED_GRAPH, OPENED_CHAIN } opened = OPENED_NONE;
 	int fd;
 	struct stat st;
 	int flags = 0;
-
-	static struct option builtin_commit_graph_verify_options[] = {
-		OPT_STRING(0, "object-dir", &opts.obj_dir,
-			   N_("dir"),
-			   N_("The object directory to store the graph")),
+	int incomplete_chain = 0;
+	int ret;
+	struct option options[] = {
 		OPT_BOOL(0, "shallow", &opts.shallow,
 			 N_("if the commit-graph is split, only verify the tip file")),
-		OPT_BOOL(0, "progress", &opts.progress, N_("force progress reporting")),
+		OPT_BOOL(0, "progress", &opts.progress,
+			 N_("force progress reporting")),
+		COMMIT_GRAPH_COMMON_OPTIONS(&opts),
 		OPT_END(),
 	};
 
 	trace2_cmd_mode("verify");
 
-	opts.progress = isatty(2);
-	argc = parse_options(argc, argv, NULL,
-			     builtin_commit_graph_verify_options,
+	argc = parse_options(argc, argv, prefix,
+			     options,
 			     builtin_commit_graph_verify_usage, 0);
+	if (argc)
+		usage_with_options(builtin_commit_graph_verify_usage, options);
 
 	if (!opts.obj_dir)
-		opts.obj_dir = get_object_directory();
+		opts.obj_dir = repo_get_object_directory(repo);
 	if (opts.shallow)
 		flags |= COMMIT_GRAPH_VERIFY_SHALLOW;
 	if (opts.progress)
 		flags |= COMMIT_GRAPH_WRITE_PROGRESS;
 
-	odb = find_odb(the_repository, opts.obj_dir);
-	graph_name = get_commit_graph_filename(odb);
-	open_ok = open_commit_graph(graph_name, &fd, &st);
-	if (!open_ok && errno != ENOENT)
+	dir = odb_source_files_find_dir(repo->objects, opts.obj_dir);
+	if (!dir)
+		die(_("could not find object directory matching %s"), opts.obj_dir);
+
+	graph_name = get_commit_graph_filename(dir->abspath);
+	chain_name = get_commit_graph_chain_filename(dir->abspath);
+	if (open_commit_graph(graph_name, &fd, &st))
+		opened = OPENED_GRAPH;
+	else if (errno != ENOENT)
 		die_errno(_("Could not open commit-graph '%s'"), graph_name);
+	else if (open_commit_graph_chain(chain_name, &fd, &st,
+					 repo->hash_algo))
+		opened = OPENED_CHAIN;
+	else if (errno != ENOENT)
+		die_errno(_("could not open commit-graph chain '%s'"), chain_name);
 
 	FREE_AND_NULL(graph_name);
+	FREE_AND_NULL(chain_name);
 
-	if (open_ok)
-		graph = load_commit_graph_one_fd_st(fd, &st, odb);
+	if (opened == OPENED_NONE)
+		return 0;
+	else if (opened == OPENED_GRAPH)
+		graph = load_commit_graph_one_fd_st(repo, dir->abspath, fd, &st);
 	else
-		graph = read_commit_graph_one(the_repository, odb);
+		graph = load_commit_graph_chain_fd_st(repo->objects, fd, &st,
+						      &incomplete_chain);
 
-	/* Return failure if open_ok predicted success */
 	if (!graph)
-		return !!open_ok;
+		return 1;
 
-	UNLEAK(graph);
-	return verify_commit_graph(the_repository, graph, flags);
+	ret = verify_commit_graph(graph, flags);
+	free_commit_graph(graph);
+
+	if (incomplete_chain) {
+		error("one or more commit-graph chain files could not be loaded");
+		ret |= 1;
+	}
+
+	return ret;
 }
 
-extern int read_replace_refs;
-static struct split_commit_graph_opts split_opts;
+struct commit_graph_write_config_data {
+	struct commit_graph_opts *write_opts;
+	struct opts_commit_graph *opts;
+};
 
 static int write_option_parse_split(const struct option *opt, const char *arg,
 				    int unset)
 {
-	enum commit_graph_split_flags *flags = opt->value;
+	struct commit_graph_write_config_data *data = opt->value;
 
-	opts.split = 1;
+	BUG_ON_OPT_NEG(unset);
+
+	data->opts->split = 1;
 	if (!arg)
 		return 0;
 
 	if (!strcmp(arg, "no-merge"))
-		*flags = COMMIT_GRAPH_SPLIT_MERGE_PROHIBITED;
+		data->write_opts->split_flags = COMMIT_GRAPH_SPLIT_MERGE_PROHIBITED;
 	else if (!strcmp(arg, "replace"))
-		*flags = COMMIT_GRAPH_SPLIT_REPLACE;
+		data->write_opts->split_flags = COMMIT_GRAPH_SPLIT_REPLACE;
 	else
 		die(_("unrecognized --split argument, %s"), arg);
 
 	return 0;
 }
 
-static int graph_write(int argc, const char **argv)
+static int read_one_commit(struct repository *repo,
+			   struct oidset *commits,
+			   struct progress *progress,
+			   const char *hash)
 {
-	struct string_list *pack_indexes = NULL;
+	struct object *result;
+	struct object_id oid;
+	const char *end;
+
+	if (parse_oid_hex_algop(hash, &oid, &end, repo->hash_algo))
+		return error(_("unexpected non-hex object ID: %s"), hash);
+
+	result = deref_tag(repo, parse_object(repo, &oid),
+			   NULL, 0);
+	if (!result)
+		return error(_("invalid object: %s"), hash);
+	else if (object_as_type(result, OBJ_COMMIT, 1))
+		oidset_insert(commits, &result->oid);
+
+	display_progress(progress, oidset_size(commits));
+
+	return 0;
+}
+
+static int write_option_max_new_filters(const struct option *opt,
+					const char *arg,
+					int unset)
+{
+	int *to = opt->value;
+	if (unset)
+		*to = -1;
+	else {
+		const char *s;
+		*to = strtol(arg, (char **)&s, 10);
+		if (*s)
+			return error(_("option `%s' expects a numerical value"),
+				     "max-new-filters");
+	}
+	return 0;
+}
+
+static int git_commit_graph_write_config(const char *var, const char *value,
+					 const struct config_context *ctx,
+					 void *cb_data)
+{
+	struct commit_graph_write_config_data *data = cb_data;
+
+	if (!strcmp(var, "commitgraph.maxnewfilters"))
+		data->write_opts->max_new_filters = git_config_int(var, value, ctx->kvi);
+	else if (!strcmp(var, "commitgraph.changedpaths"))
+		data->opts->enable_changed_paths = git_config_bool(var, value) ? 1 : -1;
+	/*
+	 * No need to fall-back to 'git_default_config', since this was already
+	 * called in 'cmd_commit_graph()'.
+	 */
+	return 0;
+}
+
+static int cmd_commit_graph_write(int argc,
+				  const char **argv,
+				  const char *prefix,
+				  struct repository *repo)
+{
+	struct commit_graph_opts write_opts = {
+		.size_multiple = 2,
+		.max_new_filters = -1,
+	};
+	struct opts_commit_graph opts = {
+		.progress = isatty(2),
+		.enable_changed_paths = -1,
+	};
+	struct commit_graph_write_config_data config_data = {
+		.write_opts = &write_opts,
+		.opts = &opts,
+	};
+	struct string_list pack_indexes = STRING_LIST_INIT_DUP;
+	struct strbuf buf = STRBUF_INIT;
 	struct oidset commits = OIDSET_INIT;
-	struct object_directory *odb = NULL;
-	struct string_list lines;
+	struct odb_files_dir *dir = NULL;
 	int result = 0;
 	enum commit_graph_write_flags flags = 0;
-
-	static struct option builtin_commit_graph_write_options[] = {
-		OPT_STRING(0, "object-dir", &opts.obj_dir,
-			N_("dir"),
-			N_("The object directory to store the graph")),
+	struct progress *progress = NULL;
+	struct option options[] = {
 		OPT_BOOL(0, "reachable", &opts.reachable,
 			N_("start walk at all refs")),
 		OPT_BOOL(0, "stdin-packs", &opts.stdin_packs,
@@ -161,123 +259,126 @@ static int graph_write(int argc, const char **argv)
 			N_("include all commits already in the commit-graph file")),
 		OPT_BOOL(0, "changed-paths", &opts.enable_changed_paths,
 			N_("enable computation for changed paths")),
-		OPT_BOOL(0, "progress", &opts.progress, N_("force progress reporting")),
-		OPT_CALLBACK_F(0, "split", &split_opts.flags, NULL,
+		OPT_CALLBACK_F(0, "split", &config_data, NULL,
 			N_("allow writing an incremental commit-graph file"),
 			PARSE_OPT_OPTARG | PARSE_OPT_NONEG,
 			write_option_parse_split),
-		OPT_INTEGER(0, "max-commits", &split_opts.max_commits,
+		OPT_INTEGER(0, "max-commits", &write_opts.max_commits,
 			N_("maximum number of commits in a non-base split commit-graph")),
-		OPT_INTEGER(0, "size-multiple", &split_opts.size_multiple,
+		OPT_INTEGER(0, "size-multiple", &write_opts.size_multiple,
 			N_("maximum ratio between two levels of a split commit-graph")),
-		OPT_EXPIRY_DATE(0, "expire-time", &split_opts.expire_time,
+		OPT_EXPIRY_DATE(0, "expire-time", &write_opts.expire_time,
 			N_("only expire files older than a given date-time")),
+		OPT_CALLBACK_F(0, "max-new-filters", &write_opts.max_new_filters,
+			NULL, N_("maximum number of changed-path Bloom filters to compute"),
+			0, write_option_max_new_filters),
+		OPT_BOOL(0, "progress", &opts.progress,
+			 N_("force progress reporting")),
+		COMMIT_GRAPH_COMMON_OPTIONS(&opts),
 		OPT_END(),
 	};
 
-	opts.progress = isatty(2);
-	split_opts.size_multiple = 2;
-	split_opts.max_commits = 0;
-	split_opts.expire_time = 0;
-
 	trace2_cmd_mode("write");
 
-	argc = parse_options(argc, argv, NULL,
-			     builtin_commit_graph_write_options,
+	repo_config(repo, git_commit_graph_write_config, &config_data);
+
+	argc = parse_options(argc, argv, prefix,
+			     options,
 			     builtin_commit_graph_write_usage, 0);
+	if (argc)
+		usage_with_options(builtin_commit_graph_write_usage, options);
 
 	if (opts.reachable + opts.stdin_packs + opts.stdin_commits > 1)
 		die(_("use at most one of --reachable, --stdin-commits, or --stdin-packs"));
 	if (!opts.obj_dir)
-		opts.obj_dir = get_object_directory();
+		opts.obj_dir = repo_get_object_directory(repo);
 	if (opts.append)
 		flags |= COMMIT_GRAPH_WRITE_APPEND;
 	if (opts.split)
 		flags |= COMMIT_GRAPH_WRITE_SPLIT;
 	if (opts.progress)
 		flags |= COMMIT_GRAPH_WRITE_PROGRESS;
-	if (opts.enable_changed_paths ||
+	if (!opts.enable_changed_paths)
+		flags |= COMMIT_GRAPH_NO_WRITE_BLOOM_FILTERS;
+	if (opts.enable_changed_paths == 1 ||
 	    git_env_bool(GIT_TEST_COMMIT_GRAPH_CHANGED_PATHS, 0))
 		flags |= COMMIT_GRAPH_WRITE_BLOOM_FILTERS;
 
-	read_replace_refs = 0;
-	odb = find_odb(the_repository, opts.obj_dir);
+	dir = odb_source_files_find_dir(repo->objects, opts.obj_dir);
+	if (!dir)
+		die(_("could not find object directory matching %s"), opts.obj_dir);
 
 	if (opts.reachable) {
-		if (write_commit_graph_reachable(odb, flags, &split_opts))
-			return 1;
-		return 0;
+		if (write_commit_graph_reachable(repo, dir->abspath, flags, &write_opts))
+			result = 1;
+		goto cleanup;
 	}
 
-	string_list_init(&lines, 0);
-	if (opts.stdin_packs || opts.stdin_commits) {
-		struct strbuf buf = STRBUF_INIT;
+	if (opts.stdin_packs) {
+		struct strbuf packname = STRBUF_INIT;
+		size_t dirlen;
 
-		while (strbuf_getline(&buf, stdin) != EOF)
-			string_list_append(&lines, strbuf_detach(&buf, NULL));
+		strbuf_addf(&packname, "%s/pack/", dir->abspath);
+		dirlen = packname.len;
 
-		if (opts.stdin_packs)
-			pack_indexes = &lines;
-		if (opts.stdin_commits) {
-			struct string_list_item *item;
-			oidset_init(&commits, lines.nr);
-			for_each_string_list_item(item, &lines) {
-				struct object_id oid;
-				const char *end;
-
-				if (parse_oid_hex(item->string, &oid, &end)) {
-					error(_("unexpected non-hex object ID: "
-						"%s"), item->string);
-					return 1;
-				}
-
-				oidset_insert(&commits, &oid);
-			}
-			flags |= COMMIT_GRAPH_WRITE_CHECK_OIDS;
+		while (strbuf_getline(&buf, stdin) != EOF) {
+			strbuf_setlen(&packname, dirlen);
+			strbuf_addbuf(&packname, &buf);
+			string_list_append(&pack_indexes, packname.buf);
 		}
 
-		UNLEAK(buf);
+		strbuf_release(&packname);
+	} else if (opts.stdin_commits) {
+		oidset_init(&commits, 0);
+		if (opts.progress)
+			progress = start_delayed_progress(
+				repo,
+				_("Collecting commits from input"), 0);
+
+		while (strbuf_getline(&buf, stdin) != EOF) {
+			if (read_one_commit(repo, &commits, progress, buf.buf)) {
+				result = 1;
+				stop_progress(&progress);
+				goto cleanup;
+			}
+		}
+
+		stop_progress(&progress);
 	}
 
-	if (write_commit_graph(odb,
-			       pack_indexes,
+	if (write_commit_graph(repo, dir->abspath,
+			       opts.stdin_packs ? &pack_indexes : NULL,
 			       opts.stdin_commits ? &commits : NULL,
 			       flags,
-			       &split_opts))
+			       &write_opts))
 		result = 1;
 
-	UNLEAK(lines);
+cleanup:
+	string_list_clear(&pack_indexes, 0);
+	strbuf_release(&buf);
+	oidset_clear(&commits);
 	return result;
 }
 
-int cmd_commit_graph(int argc, const char **argv, const char *prefix)
+int cmd_commit_graph(int argc,
+		     const char **argv,
+		     const char *prefix,
+		     struct repository *repo)
 {
-	static struct option builtin_commit_graph_options[] = {
-		OPT_STRING(0, "object-dir", &opts.obj_dir,
-			N_("dir"),
-			N_("The object directory to store the graph")),
+	parse_opt_subcommand_fn *fn = NULL;
+	struct option options[] = {
+		OPT_SUBCOMMAND("verify", &fn, cmd_commit_graph_verify),
+		OPT_SUBCOMMAND("write", &fn, cmd_commit_graph_write),
 		OPT_END(),
 	};
 
-	if (argc == 2 && !strcmp(argv[1], "-h"))
-		usage_with_options(builtin_commit_graph_usage,
-				   builtin_commit_graph_options);
+	repo_config(repo, git_default_config, NULL);
 
-	git_config(git_default_config, NULL);
-	argc = parse_options(argc, argv, prefix,
-			     builtin_commit_graph_options,
-			     builtin_commit_graph_usage,
-			     PARSE_OPT_STOP_AT_NON_OPTION);
-
+	disable_replace_refs();
 	save_commit_buffer = 0;
 
-	if (argc > 0) {
-		if (!strcmp(argv[0], "verify"))
-			return graph_verify(argc, argv);
-		if (!strcmp(argv[0], "write"))
-			return graph_write(argc, argv);
-	}
+	argc = parse_options(argc, argv, prefix, options,
+			     builtin_commit_graph_usage, 0);
 
-	usage_with_options(builtin_commit_graph_usage,
-			   builtin_commit_graph_options);
+	return fn(argc, argv, prefix, repo);
 }

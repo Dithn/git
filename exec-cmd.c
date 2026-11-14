@@ -1,7 +1,13 @@
-#include "cache.h"
+#include "git-compat-util.h"
+#include "abspath.h"
+#include "environment.h"
 #include "exec-cmd.h"
-#include "quote.h"
-#include "argv-array.h"
+#include "gettext.h"
+#include "path.h"
+#include "run-command.h"
+#include "strvec.h"
+#include "trace.h"
+#include "trace2.h"
 
 #if defined(RUNTIME_PREFIX)
 
@@ -144,6 +150,25 @@ static int git_get_exec_path_darwin(struct strbuf *buf)
 }
 #endif /* HAVE_NS_GET_EXECUTABLE_PATH */
 
+#ifdef HAVE_ZOS_GET_EXECUTABLE_PATH
+/*
+ * Resolves the executable path from current program's directory and name.
+ *
+ * Returns 0 on success, -1 on failure.
+ */
+static int git_get_exec_path_zos(struct strbuf *buf)
+{
+	char *dir = __getprogramdir();
+	char *exe = getprogname();
+	if (dir && exe) {
+		strbuf_addf(buf, "%s/%s", dir, exe);
+		return 0;
+	}
+	return -1;
+}
+
+#endif /* HAVE_ZOS_GET_EXECUTABLE_PATH */
+
 #ifdef HAVE_WPGMPTR
 /*
  * Resolves the executable path by using the global variable _wpgmptr.
@@ -200,6 +225,10 @@ static int git_get_exec_path(struct strbuf *buf, const char *argv0)
 		git_get_exec_path_wpgmptr(buf) &&
 #endif /* HAVE_WPGMPTR */
 
+#ifdef HAVE_ZOS_GET_EXECUTABLE_PATH
+		git_get_exec_path_zos(buf) &&
+#endif /*HAVE_ZOS_GET_EXECUTABLE_PATH */
+
 		git_get_exec_path_from_argv0(buf, argv0)) {
 		return -1;
 	}
@@ -252,7 +281,7 @@ static const char *system_prefix(void)
  * This is called during initialization, but No work needs to be done here when
  * runtime prefix is not being used.
  */
-void git_resolve_executable_dir(const char *argv0)
+void git_resolve_executable_dir(const char *argv0 UNUSED)
 {
 }
 
@@ -320,26 +349,26 @@ void setup_path(void)
 	strbuf_release(&new_path);
 }
 
-const char **prepare_git_cmd(struct argv_array *out, const char **argv)
+const char **prepare_git_cmd(struct strvec *out, const char **argv)
 {
-	argv_array_push(out, "git");
-	argv_array_pushv(out, argv);
-	return out->argv;
+	strvec_push(out, "git");
+	strvec_pushv(out, argv);
+	return out->v;
 }
 
 int execv_git_cmd(const char **argv)
 {
-	struct argv_array nargv = ARGV_ARRAY_INIT;
+	struct strvec nargv = STRVEC_INIT;
 
 	prepare_git_cmd(&nargv, argv);
-	trace_argv_printf(nargv.argv, "trace: exec:");
+	trace_argv_printf(nargv.v, "trace: exec:");
 
 	/* execvp() can only ever return if it fails */
-	sane_execvp("git", (char **)nargv.argv);
+	sane_execvp("git", (char **)nargv.v);
 
 	trace_printf("trace: exec failed: %s\n", strerror(errno));
 
-	argv_array_clear(&nargv);
+	strvec_clear(&nargv);
 	return -1;
 }
 

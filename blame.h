@@ -1,12 +1,9 @@
 #ifndef BLAME_H
 #define BLAME_H
 
-#include "cache.h"
-#include "commit.h"
+#include "oidset.h"
 #include "xdiff-interface.h"
-#include "revision.h"
 #include "prio-queue.h"
-#include "diff.h"
 
 #define PICKAXE_BLAME_MOVE		01
 #define PICKAXE_BLAME_COPY		02
@@ -119,7 +116,7 @@ struct blame_scoreboard {
 	 * Used by many functions to obtain contents of the nth line,
 	 * indexed with scoreboard.lineno[blame_entry.lno].
 	 */
-	const char *final_buf;
+	char *final_buf;
 	unsigned long final_buf_size;
 
 	/* linked list of blames */
@@ -181,10 +178,8 @@ const char *blame_nth_line(struct blame_scoreboard *sb, long lno);
 
 void init_scoreboard(struct blame_scoreboard *sb);
 void setup_scoreboard(struct blame_scoreboard *sb,
-		      const char *path,
 		      struct blame_origin **orig);
-void setup_blame_bloom_data(struct blame_scoreboard *sb,
-			    const char *path);
+void setup_blame_bloom_data(struct blame_scoreboard *sb);
 void cleanup_scoreboard(struct blame_scoreboard *sb);
 
 struct blame_entry *blame_entry_prepend(struct blame_entry *head,

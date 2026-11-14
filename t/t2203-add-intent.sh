@@ -16,7 +16,8 @@ test_expect_success 'intent to add' '
 '
 
 test_expect_success 'git status' '
-	git status --porcelain | grep -v actual >actual &&
+	git status --porcelain >actual.raw &&
+	grep -v actual actual.raw >actual &&
 	cat >expect <<-\EOF &&
 	DA 1.t
 	A  elif
@@ -26,7 +27,8 @@ test_expect_success 'git status' '
 '
 
 test_expect_success 'git status with porcelain v2' '
-	git status --porcelain=v2 | grep -v "^?" >actual &&
+	git status --porcelain=v2 >actual.raw &&
+	grep -v "^?" actual.raw >actual &&
 	nam1=$(echo 1 | git hash-object --stdin) &&
 	nam2=$(git hash-object elif) &&
 	cat >expect <<-EOF &&
@@ -55,7 +57,7 @@ test_expect_success 'intent to add does not clobber existing paths' '
 	git add -N file elif &&
 	empty=$(git hash-object --stdin </dev/null) &&
 	git ls-files -s >actual &&
-	! grep "$empty" actual
+	test_grep ! "$empty" actual
 '
 
 test_expect_success 'i-t-a entry is simply ignored' '
@@ -116,13 +118,13 @@ test_expect_success 'cache-tree does not ignore dir that has i-t-a entries' '
 		mkdir 2 &&
 		for f in 1 2/1 2/2 3
 		do
-			echo "$f" >"$f"
+			echo "$f" >"$f" || return 1
 		done &&
 		git add 1 2/2 3 &&
 		git add -N 2/1 &&
 		git commit -m committed &&
 		git ls-tree -r HEAD >actual &&
-		grep 2/2 actual
+		test_grep 2/2 actual
 	)
 '
 
@@ -171,17 +173,20 @@ test_expect_success 'rename detection finds the right names' '
 		mv first third &&
 		git add -N third &&
 
-		git status | grep -v "^?" >actual.1 &&
-		test_i18ngrep "renamed: *first -> third" actual.1 &&
+		git status >actual.raw.1 &&
+		grep -v "^?" actual.raw.1 >actual.1 &&
+		test_grep "renamed: *first -> third" actual.1 &&
 
-		git status --porcelain | grep -v "^?" >actual.2 &&
+		git status --porcelain >actual.raw.2 &&
+		grep -v "^?" actual.raw.2 >actual.2 &&
 		cat >expected.2 <<-\EOF &&
 		 R first -> third
 		EOF
 		test_cmp expected.2 actual.2 &&
 
 		hash=$(git hash-object third) &&
-		git status --porcelain=v2 | grep -v "^?" >actual.3 &&
+		git status --porcelain=v2 >actual.raw.3 &&
+		grep -v "^?" actual.raw.3 >actual.3 &&
 		cat >expected.3 <<-EOF &&
 		2 .R N... 100644 100644 100644 $hash $hash R100 third	first
 		EOF
@@ -211,11 +216,13 @@ test_expect_success 'double rename detection in status' '
 		mv second third &&
 		git add -N third &&
 
-		git status | grep -v "^?" >actual.1 &&
-		test_i18ngrep "renamed: *first -> second" actual.1 &&
-		test_i18ngrep "renamed: *second -> third" actual.1 &&
+		git status >actual.raw.1 &&
+		grep -v "^?" actual.raw.1 >actual.1 &&
+		test_grep "renamed: *first -> second" actual.1 &&
+		test_grep "renamed: *second -> third" actual.1 &&
 
-		git status --porcelain | grep -v "^?" >actual.2 &&
+		git status --porcelain >actual.raw.2 &&
+		grep -v "^?" actual.raw.2 >actual.2 &&
 		cat >expected.2 <<-\EOF &&
 		R  first -> second
 		 R second -> third
@@ -223,7 +230,8 @@ test_expect_success 'double rename detection in status' '
 		test_cmp expected.2 actual.2 &&
 
 		hash=$(git hash-object third) &&
-		git status --porcelain=v2 | grep -v "^?" >actual.3 &&
+		git status --porcelain=v2 >actual.raw.3 &&
+		grep -v "^?" actual.raw.3 >actual.3 &&
 		cat >expected.3 <<-EOF &&
 		2 R. N... 100644 100644 100644 $hash $hash R100 second	first
 		2 .R N... 100644 100644 100644 $hash $hash R100 third	second
@@ -232,17 +240,53 @@ test_expect_success 'double rename detection in status' '
 	)
 '
 
-test_expect_success 'diff-files/diff-cached shows ita as new/not-new files' '
+test_expect_success 'i-t-a files shown as new for "diff", "diff-files"; not-new for "diff --cached"' '
 	git reset --hard &&
-	echo new >new-ita &&
-	git add -N new-ita &&
-	git diff --summary >actual &&
-	echo " create mode 100644 new-ita" >expected &&
-	test_cmp expected actual &&
-	git diff --cached --summary >actual2 &&
-	test_must_be_empty actual2
-'
+	: >empty &&
+	content="foo" &&
+	echo "$content" >not-empty &&
 
+	hash_e=$(git hash-object empty) &&
+	hash_n=$(git hash-object not-empty) &&
+
+	cat >expect.diff_p <<-EOF &&
+	diff --git a/empty b/empty
+	new file mode 100644
+	index 0000000..$(git rev-parse --short $hash_e)
+	diff --git a/not-empty b/not-empty
+	new file mode 100644
+	index 0000000..$(git rev-parse --short $hash_n)
+	--- /dev/null
+	+++ b/not-empty
+	@@ -0,0 +1 @@
+	+$content
+	EOF
+	cat >expect.diff_s <<-EOF &&
+	 create mode 100644 empty
+	 create mode 100644 not-empty
+	EOF
+	cat >expect.diff_a <<-EOF &&
+	:000000 100644 0000000 0000000 A$(printf "\t")empty
+	:000000 100644 0000000 0000000 A$(printf "\t")not-empty
+	EOF
+
+	git add -N empty not-empty &&
+
+	git diff >actual &&
+	test_cmp expect.diff_p actual &&
+
+	git diff --summary >actual &&
+	test_cmp expect.diff_s actual &&
+
+	git diff-files -p >actual &&
+	test_cmp expect.diff_p actual &&
+
+	git diff-files --abbrev >actual &&
+	test_cmp expect.diff_a actual &&
+
+	git diff --cached >actual &&
+	test_must_be_empty actual
+'
 
 test_expect_success '"diff HEAD" includes ita as new files' '
 	git reset --hard &&
@@ -268,7 +312,7 @@ test_expect_success 'apply --intent-to-add' '
 	echo new >new-ita &&
 	git add -N new-ita &&
 	git diff >expected &&
-	grep "new file" expected &&
+	test_grep "new file" expected &&
 	git reset --hard &&
 	git apply --intent-to-add expected &&
 	git diff >actual &&

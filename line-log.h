@@ -1,22 +1,11 @@
 #ifndef LINE_LOG_H
 #define LINE_LOG_H
 
-#include "diffcore.h"
+#include "diffcore.h" /* struct range, struct range_set */
 
 struct rev_info;
 struct commit;
-
-/* A range [start,end].  Lines are numbered starting at 0, and the
- * ranges include start but exclude end. */
-struct range {
-	long start, end;
-};
-
-/* A set of ranges.  The ranges must always be disjoint and sorted. */
-struct range_set {
-	unsigned int alloc, nr;
-	struct range *ranges;
-};
+struct string_list;
 
 /* A diff, encoded as the set of pre- and post-image ranges where the
  * files differ. A pair of ranges corresponds to a hunk. */
@@ -46,10 +35,7 @@ void sort_and_merge_range_set(struct range_set *);
 struct line_log_data {
 	struct line_log_data *next;
 	char *path;
-	char status;
 	struct range_set ranges;
-	int arg_alloc, arg_nr;
-	const char **args;
 	struct diff_filepair *pair;
 	struct diff_ranges diff;
 };
@@ -57,7 +43,11 @@ struct line_log_data {
 void line_log_init(struct rev_info *rev, const char *prefix, struct string_list *args);
 
 int line_log_filter(struct rev_info *rev);
+int line_log_process_ranges_arbitrary_commit(struct rev_info *rev,
+						    struct commit *commit);
 
-int line_log_print(struct rev_info *rev, struct commit *commit);
+void line_log_queue_pairs(struct rev_info *rev, struct commit *commit);
+
+void line_log_free(struct rev_info *rev);
 
 #endif /* LINE_LOG_H */

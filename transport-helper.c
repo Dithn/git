@@ -1,24 +1,30 @@
-#include "cache.h"
+#define USE_THE_REPOSITORY_VARIABLE
+
+#include "git-compat-util.h"
 #include "transport.h"
 #include "quote.h"
 #include "run-command.h"
 #include "commit.h"
-#include "diff.h"
-#include "revision.h"
+#include "environment.h"
+#include "gettext.h"
+#include "hex.h"
+#include "object-name.h"
+#include "repository.h"
 #include "remote.h"
 #include "string-list.h"
 #include "thread-utils.h"
 #include "sigchain.h"
-#include "argv-array.h"
+#include "strvec.h"
 #include "refs.h"
 #include "refspec.h"
 #include "transport-internal.h"
 #include "protocol.h"
+#include "packfile.h"
 
 static int debug;
 
 struct helper_data {
-	const char *name;
+	char *name;
 	struct child_process *helper;
 	FILE *out;
 	unsigned fetch : 1,
@@ -32,7 +38,8 @@ struct helper_data {
 		signed_tags : 1,
 		check_connectivity : 1,
 		no_disconnect_req : 1,
-		no_private_update : 1;
+		no_private_update : 1,
+		object_format : 1;
 
 	/*
 	 * As an optimization, the transport code may invoke fetch before
@@ -82,11 +89,18 @@ static int recvline(struct helper_data *helper, struct strbuf *buffer)
 	return recvline_fh(helper->out, buffer);
 }
 
-static void write_constant(int fd, const char *str)
+static int write_constant_gently(int fd, const char *str)
 {
 	if (debug)
 		fprintf(stderr, "Debug: Remote helper: -> %s", str);
 	if (write_in_full(fd, str, strlen(str)) < 0)
+		return -1;
+	return 0;
+}
+
+static void write_constant(int fd, const char *str)
+{
+	if (write_constant_gently(fd, str) < 0)
 		die_errno(_("full write to remote helper failed"));
 }
 
@@ -106,6 +120,7 @@ static void do_take_over(struct transport *transport)
 	data = (struct helper_data *)transport->data;
 	transport_take_over(transport, data->helper);
 	fclose(data->out);
+	free(data->name);
 	free(data);
 }
 
@@ -127,17 +142,17 @@ static struct child_process *get_helper(struct transport *transport)
 	helper->in = -1;
 	helper->out = -1;
 	helper->err = 0;
-	argv_array_pushf(&helper->args, "git-remote-%s", data->name);
-	argv_array_push(&helper->args, transport->remote->name);
-	argv_array_push(&helper->args, remove_ext_force(transport->url));
-	helper->git_cmd = 0;
+	strvec_pushf(&helper->args, "remote-%s", data->name);
+	strvec_push(&helper->args, transport->remote->name);
+	strvec_push(&helper->args, remove_ext_force(transport->url));
+	helper->git_cmd = 1;
 	helper->silent_exec_failure = 1;
 
 	if (have_git_dir())
-		argv_array_pushf(&helper->env_array, "%s=%s",
-				 GIT_DIR_ENVIRONMENT, get_git_dir());
+		strvec_pushf(&helper->env, "%s=%s",
+			     GIT_DIR_ENVIRONMENT, repo_get_git_dir(the_repository));
 
-	helper->trace2_child_class = helper->args.argv[0]; /* "remote-<name>" */
+	helper->trace2_child_class = helper->args.v[0]; /* "remote-<name>" */
 
 	code = start_command(helper);
 	if (code < 0 && errno == ENOENT)
@@ -147,7 +162,7 @@ static struct child_process *get_helper(struct transport *transport)
 
 	data->helper = helper;
 	data->no_disconnect_req = 0;
-	refspec_init(&data->rs, REFSPEC_FETCH);
+	refspec_init_fetch(&data->rs, the_hash_algo);
 
 	/*
 	 * Open the output as FILE* so strbuf_getline_*() family of
@@ -160,13 +175,16 @@ static struct child_process *get_helper(struct transport *transport)
 		die_errno(_("can't dup helper output fd"));
 	data->out = xfdopen(duped, "r");
 
-	write_constant(helper->in, "capabilities\n");
+	sigchain_push(SIGPIPE, SIG_IGN);
+	if (write_constant_gently(helper->in, "capabilities\n") < 0)
+		die("remote helper '%s' aborted session", data->name);
+	sigchain_pop(SIGPIPE);
 
 	while (1) {
 		const char *capname, *arg;
 		int mandatory = 0;
 		if (recvline(data, &buf))
-			exit(128);
+			die("remote helper '%s' aborted session", data->name);
 
 		if (!*buf.buf)
 			break;
@@ -207,6 +225,8 @@ static struct child_process *get_helper(struct transport *transport)
 			data->import_marks = xstrdup(arg);
 		} else if (starts_with(capname, "no-private-update")) {
 			data->no_private_update = 1;
+		} else if (starts_with(capname, "object-format")) {
+			data->object_format = 1;
 		} else if (mandatory) {
 			die(_("unknown mandatory capability %s; this remote "
 			      "helper probably needs newer version of Git"),
@@ -248,6 +268,7 @@ static int disconnect_helper(struct transport *transport)
 		res = finish_command(data->helper);
 		FREE_AND_NULL(data->helper);
 	}
+	FREE_AND_NULL(data->name);
 	return res;
 }
 
@@ -292,9 +313,9 @@ static int string_list_set_helper_option(struct helper_data *data,
 					 struct string_list *list)
 {
 	struct strbuf buf = STRBUF_INIT;
-	int i, ret = 0;
+	int ret = 0;
 
-	for (i = 0; i < list->nr; i++) {
+	for (size_t i = 0; i < list->nr; i++) {
 		strbuf_addf(&buf, "option %s ", name);
 		quote_c_style(list->items[i].string, &buf, NULL, 0);
 		strbuf_addch(&buf, '\n');
@@ -312,7 +333,7 @@ static int set_helper_option(struct transport *transport,
 {
 	struct helper_data *data = transport->data;
 	struct strbuf buf = STRBUF_INIT;
-	int i, ret, is_bool = 0;
+	int ret, is_bool = 0;
 
 	get_helper(transport);
 
@@ -323,12 +344,12 @@ static int set_helper_option(struct transport *transport,
 		return string_list_set_helper_option(data, name,
 						     (struct string_list *)value);
 
-	for (i = 0; i < ARRAY_SIZE(unsupported_options); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(unsupported_options); i++) {
 		if (!strcmp(name, unsupported_options[i]))
 			return 1;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(boolean_options); i++) {
+	for (size_t i = 0; i < ARRAY_SIZE(boolean_options); i++) {
 		if (!strcmp(name, boolean_options[i])) {
 			is_bool = 1;
 			break;
@@ -378,6 +399,9 @@ static int release_helper(struct transport *transport)
 	int res = 0;
 	struct helper_data *data = transport->data;
 	refspec_clear(&data->rs);
+	free(data->import_marks);
+	free(data->export_marks);
+	transport_options_release(&data->transport_options);
 	res = disconnect_helper(transport);
 	free(transport->data);
 	return res;
@@ -410,10 +434,11 @@ static int fetch_with_fetch(struct transport *transport,
 			exit(128);
 
 		if (skip_prefix(buf.buf, "lock ", &name)) {
-			if (transport->pack_lockfile)
+			if (transport->pack_lockfiles.nr)
 				warning(_("%s also locked %s"), data->name, name);
 			else
-				transport->pack_lockfile = xstrdup(name);
+				string_list_append(&transport->pack_lockfiles,
+						   name);
 		}
 		else if (data->check_connectivity &&
 			 data->transport_options.check_self_contained_and_connected &&
@@ -425,6 +450,8 @@ static int fetch_with_fetch(struct transport *transport,
 			warning(_("%s unexpectedly said: '%s'"), data->name, buf.buf);
 	}
 	strbuf_release(&buf);
+
+	odb_reprepare(the_repository->objects);
 	return 0;
 }
 
@@ -435,13 +462,13 @@ static int get_importer(struct transport *transport, struct child_process *fasti
 	int cat_blob_fd, code;
 	child_process_init(fastimport);
 	fastimport->in = xdup(helper->out);
-	argv_array_push(&fastimport->args, "fast-import");
-	argv_array_push(&fastimport->args, "--allow-unsafe-features");
-	argv_array_push(&fastimport->args, debug ? "--stats" : "--quiet");
+	strvec_push(&fastimport->args, "fast-import");
+	strvec_push(&fastimport->args, "--allow-unsafe-features");
+	strvec_push(&fastimport->args, debug ? "--stats" : "--quiet");
 
 	if (data->bidi_import) {
 		cat_blob_fd = xdup(helper->in);
-		argv_array_pushf(&fastimport->args, "--cat-blob-fd=%d", cat_blob_fd);
+		strvec_pushf(&fastimport->args, "--cat-blob-fd=%d", cat_blob_fd);
 	}
 	fastimport->git_cmd = 1;
 
@@ -455,24 +482,25 @@ static int get_exporter(struct transport *transport,
 {
 	struct helper_data *data = transport->data;
 	struct child_process *helper = get_helper(transport);
-	int i;
 
 	child_process_init(fastexport);
 
 	/* we need to duplicate helper->in because we want to use it after
 	 * fastexport is done with it. */
 	fastexport->out = dup(helper->in);
-	argv_array_push(&fastexport->args, "fast-export");
-	argv_array_push(&fastexport->args, "--use-done-feature");
-	argv_array_push(&fastexport->args, data->signed_tags ?
+	if (fastexport->out < 0)
+		return error_errno(_("could not dup helper output fd"));
+	strvec_push(&fastexport->args, "fast-export");
+	strvec_push(&fastexport->args, "--use-done-feature");
+	strvec_push(&fastexport->args, data->signed_tags ?
 		"--signed-tags=verbatim" : "--signed-tags=warn-strip");
 	if (data->export_marks)
-		argv_array_pushf(&fastexport->args, "--export-marks=%s.tmp", data->export_marks);
+		strvec_pushf(&fastexport->args, "--export-marks=%s.tmp", data->export_marks);
 	if (data->import_marks)
-		argv_array_pushf(&fastexport->args, "--import-marks=%s", data->import_marks);
+		strvec_pushf(&fastexport->args, "--import-marks=%s", data->import_marks);
 
-	for (i = 0; i < revlist_args->nr; i++)
-		argv_array_push(&fastexport->args, revlist_args->items[i].string);
+	for (size_t i = 0; i < revlist_args->nr; i++)
+		strvec_push(&fastexport->args, revlist_args->items[i].string);
 
 	fastexport->git_cmd = 1;
 	return start_command(fastexport);
@@ -541,7 +569,7 @@ static int fetch_with_import(struct transport *transport,
 		else
 			private = xstrdup(name);
 		if (private) {
-			if (read_ref(private, &posn->old_oid) < 0)
+			if (refs_read_ref(get_main_ref_store(the_repository), private, &posn->old_oid) < 0)
 				die(_("could not read ref %s"), private);
 			free(private);
 		}
@@ -595,8 +623,22 @@ static int run_connect(struct transport *transport, struct strbuf *cmdbuf)
 	return ret;
 }
 
+static const char *connect_service_cmd(enum git_connect_service service)
+{
+	switch (service) {
+	case GIT_CONNECT_UPLOAD_PACK:
+		return "git-upload-pack";
+	case GIT_CONNECT_RECEIVE_PACK:
+		return "git-receive-pack";
+	case GIT_CONNECT_UPLOAD_ARCHIVE:
+		return "git-upload-archive";
+	}
+	BUG("unknown git_connect_service: %d", service);
+}
+
 static int process_connect_service(struct transport *transport,
-				   const char *name, const char *exec)
+				   enum git_connect_service service,
+				   const char *exec)
 {
 	struct helper_data *data = transport->data;
 	struct strbuf cmdbuf = STRBUF_INIT;
@@ -606,7 +648,7 @@ static int process_connect_service(struct transport *transport,
 	 * Handle --upload-pack and friends. This is fire and forget...
 	 * just warn if it fails.
 	 */
-	if (strcmp(name, exec)) {
+	if (strcmp(connect_service_cmd(service), exec)) {
 		int r = set_helper_option(transport, "servpath", exec);
 		if (r > 0)
 			warning(_("setting remote service path not supported by protocol"));
@@ -615,12 +657,15 @@ static int process_connect_service(struct transport *transport,
 	}
 
 	if (data->connect) {
-		strbuf_addf(&cmdbuf, "connect %s\n", name);
+		strbuf_addf(&cmdbuf, "connect %s\n",
+			    connect_service_cmd(service));
 		ret = run_connect(transport, &cmdbuf);
 	} else if (data->stateless_connect &&
 		   (get_protocol_version_config() == protocol_v2) &&
-		   !strcmp("git-upload-pack", name)) {
-		strbuf_addf(&cmdbuf, "stateless-connect %s\n", name);
+		   (service == GIT_CONNECT_UPLOAD_PACK ||
+		    service == GIT_CONNECT_UPLOAD_ARCHIVE)) {
+		strbuf_addf(&cmdbuf, "stateless-connect %s\n",
+			    connect_service_cmd(service));
 		ret = run_connect(transport, &cmdbuf);
 		if (ret)
 			transport->stateless_rpc = 1;
@@ -634,54 +679,73 @@ static int process_connect(struct transport *transport,
 				     int for_push)
 {
 	struct helper_data *data = transport->data;
-	const char *name;
+	enum git_connect_service service;
 	const char *exec;
+	int ret;
 
-	name = for_push ? "git-receive-pack" : "git-upload-pack";
+	service = for_push ? GIT_CONNECT_RECEIVE_PACK : GIT_CONNECT_UPLOAD_PACK;
 	if (for_push)
 		exec = data->transport_options.receivepack;
 	else
 		exec = data->transport_options.uploadpack;
 
-	return process_connect_service(transport, name, exec);
+	ret = process_connect_service(transport, service, exec);
+	if (ret)
+		do_take_over(transport);
+	return ret;
 }
 
-static int connect_helper(struct transport *transport, const char *name,
-		   const char *exec, int fd[2])
+static int connect_helper(struct transport *transport, enum git_connect_service service,
+			  const char *exec, int fd[2])
 {
 	struct helper_data *data = transport->data;
 
 	/* Get_helper so connect is inited. */
 	get_helper(transport);
-	if (!data->connect)
-		die(_("operation not supported by protocol"));
 
-	if (!process_connect_service(transport, name, exec))
-		die(_("can't connect to subservice %s"), name);
+	if (!process_connect_service(transport, service, exec))
+		die(_("can't connect to subservice %s"),
+		    connect_service_cmd(service));
 
 	fd[0] = data->helper->out;
 	fd[1] = data->helper->in;
+
+	do_take_over(transport);
 	return 0;
 }
 
 static struct ref *get_refs_list_using_list(struct transport *transport,
 					    int for_push);
 
-static int fetch(struct transport *transport,
-		 int nr_heads, struct ref **to_fetch)
+static int fetch_refs(struct transport *transport,
+		      int nr_heads, struct ref **to_fetch)
 {
 	struct helper_data *data = transport->data;
 	int i, count;
 
 	get_helper(transport);
 
-	if (process_connect(transport, 0)) {
-		do_take_over(transport);
-		return transport->vtable->fetch(transport, nr_heads, to_fetch);
+	if (process_connect(transport, 0))
+		return transport->vtable->fetch_refs(transport, nr_heads, to_fetch);
+
+	/*
+	 * If we reach here, then the server, the client, and/or the transport
+	 * helper does not support protocol v2. --negotiate-only requires
+	 * protocol v2.
+	 */
+	if (data->transport_options.acked_commits) {
+		warning(_("--negotiate-only requires protocol v2"));
+		return -1;
 	}
 
-	if (!data->get_refs_list_called)
-		get_refs_list_using_list(transport, 0);
+	if (!data->get_refs_list_called) {
+		/*
+		 * We do not care about the list of refs returned, but only
+		 * that the "list" command was sent.
+		 */
+		struct ref *dummy = get_refs_list_using_list(transport, 0);
+		free_refs(dummy);
+	}
 
 	count = 0;
 	for (i = 0; i < nr_heads; i++)
@@ -701,14 +765,18 @@ static int fetch(struct transport *transport,
 	if (data->transport_options.update_shallow)
 		set_helper_option(transport, "update-shallow", "true");
 
+	if (data->transport_options.refetch)
+		set_helper_option(transport, "refetch", "true");
+
 	if (data->transport_options.filter_options.choice) {
 		const char *spec = expand_list_objects_filter_spec(
 			&data->transport_options.filter_options);
 		set_helper_option(transport, "filter", spec);
 	}
 
-	if (data->transport_options.negotiation_tips)
-		warning("Ignoring --negotiation-tip because the protocol does not support it.");
+	if (data->transport_options.negotiation_restrict_tips)
+		warning(_("ignoring %s because the protocol does not support it."),
+			"--negotiation-restrict");
 
 	if (data->fetch)
 		return fetch_with_fetch(transport, nr_heads, to_fetch);
@@ -719,12 +787,73 @@ static int fetch(struct transport *transport,
 	return -1;
 }
 
+static int fetch_object_info_helper(struct transport *transport,
+				    const struct oid_array *oids,
+				    struct fetch_object_info_results *results)
+{
+	get_helper(transport);
+	if (process_connect(transport, 0))
+		return transport->vtable->fetch_object_info(transport, oids,
+							    results);
+
+	die(_("object-info requires protocol v2"));
+}
+
+struct push_update_ref_state {
+	struct ref *hint;
+	struct ref_push_report *report;
+	int new_report;
+};
+
 static int push_update_ref_status(struct strbuf *buf,
-				   struct ref **ref,
+				   struct push_update_ref_state *state,
 				   struct ref *remote_refs)
 {
 	char *refname, *msg;
 	int status, forced = 0;
+
+	if (starts_with(buf->buf, "option ")) {
+		struct object_id old_oid, new_oid;
+		char *key;
+		const char *val;
+		char *p;
+
+		if (!state->hint || !(state->report || state->new_report))
+			die(_("'option' without a matching 'ok/error' directive"));
+		if (state->new_report) {
+			if (!state->hint->report) {
+				CALLOC_ARRAY(state->hint->report, 1);
+				state->report = state->hint->report;
+			} else {
+				state->report = state->hint->report;
+				while (state->report->next)
+					state->report = state->report->next;
+				CALLOC_ARRAY(state->report->next, 1);
+				state->report = state->report->next;
+			}
+			state->new_report = 0;
+		}
+		key = buf->buf + 7;
+		p = strchr(key, ' ');
+		if (p)
+			*p++ = '\0';
+		val = p;
+		if (!strcmp(key, "refname"))
+			state->report->ref_name = xstrdup_or_null(val);
+		else if (!strcmp(key, "old-oid") && val &&
+			 !parse_oid_hex(val, &old_oid, &val))
+			state->report->old_oid = oiddup(&old_oid);
+		else if (!strcmp(key, "new-oid") && val &&
+			 !parse_oid_hex(val, &new_oid, &val))
+			state->report->new_oid = oiddup(&new_oid);
+		else if (!strcmp(key, "forced-update"))
+			state->report->forced_update = 1;
+		/* Not update remote namespace again. */
+		return 1;
+	}
+
+	state->report = NULL;
+	state->new_report = 0;
 
 	if (starts_with(buf->buf, "ok ")) {
 		status = REF_STATUS_OK;
@@ -775,22 +904,30 @@ static int push_update_ref_status(struct strbuf *buf,
 			status = REF_STATUS_REJECT_STALE;
 			FREE_AND_NULL(msg);
 		}
+		else if (!strcmp(msg, "remote ref updated since checkout")) {
+			status = REF_STATUS_REJECT_REMOTE_UPDATED;
+			FREE_AND_NULL(msg);
+		}
 		else if (!strcmp(msg, "forced update")) {
 			forced = 1;
 			FREE_AND_NULL(msg);
 		}
+		else if (!strcmp(msg, "expecting report")) {
+			status = REF_STATUS_EXPECTING_REPORT;
+			FREE_AND_NULL(msg);
+		}
 	}
 
-	if (*ref)
-		*ref = find_ref_by_name(*ref, refname);
-	if (!*ref)
-		*ref = find_ref_by_name(remote_refs, refname);
-	if (!*ref) {
+	if (state->hint)
+		state->hint = find_ref_by_name(state->hint, refname);
+	if (!state->hint)
+		state->hint = find_ref_by_name(remote_refs, refname);
+	if (!state->hint) {
 		warning(_("helper reported unexpected status of %s"), refname);
 		return 1;
 	}
 
-	if ((*ref)->status != REF_STATUS_NONE) {
+	if (state->hint->status != REF_STATUS_NONE) {
 		/*
 		 * Earlier, the ref was marked not to be pushed, so ignore the ref
 		 * status reported by the remote helper if the latter is 'no match'.
@@ -799,9 +936,11 @@ static int push_update_ref_status(struct strbuf *buf,
 			return 1;
 	}
 
-	(*ref)->status = status;
-	(*ref)->forced_update |= forced;
-	(*ref)->remote_status = msg;
+	if (status == REF_STATUS_OK)
+		state->new_report = 1;
+	state->hint->status = status;
+	state->hint->forced_update |= forced;
+	state->hint->remote_status = msg;
 	return !(status == REF_STATUS_OK);
 }
 
@@ -809,37 +948,60 @@ static int push_update_refs_status(struct helper_data *data,
 				    struct ref *remote_refs,
 				    int flags)
 {
+	struct ref *ref;
+	struct ref_push_report *report;
 	struct strbuf buf = STRBUF_INIT;
-	struct ref *ref = remote_refs;
-	int ret = 0;
+	struct push_update_ref_state state = { remote_refs, NULL, 0 };
 
 	for (;;) {
-		char *private;
-
 		if (recvline(data, &buf)) {
-			ret = 1;
-			break;
+			strbuf_release(&buf);
+			return 1;
 		}
-
 		if (!buf.len)
 			break;
-
-		if (push_update_ref_status(&buf, &ref, remote_refs))
-			continue;
-
-		if (flags & TRANSPORT_PUSH_DRY_RUN || !data->rs.nr || data->no_private_update)
-			continue;
-
-		/* propagate back the update to the remote namespace */
-		private = apply_refspecs(&data->rs, ref->name);
-		if (!private)
-			continue;
-		update_ref("update by helper", private, &ref->new_oid, NULL,
-			   0, 0);
-		free(private);
+		push_update_ref_status(&buf, &state, remote_refs);
 	}
 	strbuf_release(&buf);
-	return ret;
+
+	if (flags & TRANSPORT_PUSH_DRY_RUN || !data->rs.nr || data->no_private_update)
+		return 0;
+
+	/* propagate back the update to the remote namespace */
+	for (ref = remote_refs; ref; ref = ref->next) {
+		char *private;
+
+		if (ref->status != REF_STATUS_OK)
+			continue;
+
+		if (!ref->report) {
+			private = apply_refspecs(&data->rs, ref->name);
+			if (!private)
+				continue;
+			refs_update_ref(get_main_ref_store(the_repository),
+					"update by helper", private,
+					&(ref->new_oid),
+					NULL, 0, 0);
+			free(private);
+		} else {
+			for (report = ref->report; report; report = report->next) {
+				private = apply_refspecs(&data->rs,
+							 report->ref_name
+							 ? report->ref_name
+							 : ref->name);
+				if (!private)
+					continue;
+				refs_update_ref(get_main_ref_store(the_repository),
+						"update by helper", private,
+						report->new_oid
+						? report->new_oid
+						: &(ref->new_oid),
+						NULL, 0, 0);
+				free(private);
+			}
+		}
+	}
+	return 0;
 }
 
 static void set_common_push_options(struct transport *transport,
@@ -859,6 +1021,11 @@ static void set_common_push_options(struct transport *transport,
 	if (flags & TRANSPORT_PUSH_ATOMIC)
 		if (set_helper_option(transport, TRANS_OPT_ATOMIC, "true") != 0)
 			die(_("helper %s does not support --atomic"), name);
+
+	if (flags & TRANSPORT_PUSH_FORCE_IF_INCLUDES)
+		if (set_helper_option(transport, TRANS_OPT_FORCE_IF_INCLUDES, "true") != 0)
+			die(_("helper %s does not support --%s"),
+			    name, TRANS_OPT_FORCE_IF_INCLUDES);
 
 	if (flags & TRANSPORT_PUSH_OPTIONS) {
 		struct string_list_item *item;
@@ -893,9 +1060,11 @@ static int push_refs_with_push(struct transport *transport,
 		case REF_STATUS_REJECT_NONFASTFORWARD:
 		case REF_STATUS_REJECT_STALE:
 		case REF_STATUS_REJECT_ALREADY_EXISTS:
+		case REF_STATUS_REJECT_REMOTE_UPDATED:
 			if (atomic) {
 				reject_atomic_push(remote_refs, mirror);
 				string_list_clear(&cas_options, 0);
+				strbuf_release(&buf);
 				return 0;
 			} else
 				continue;
@@ -915,7 +1084,7 @@ static int push_refs_with_push(struct transport *transport,
 			if (ref->peer_ref)
 				strbuf_addstr(&buf, ref->peer_ref->name);
 			else
-				strbuf_addstr(&buf, oid_to_hex(&ref->new_oid));
+				strbuf_add_oid_hex(&buf, &ref->new_oid);
 		}
 		strbuf_addch(&buf, ':');
 		strbuf_addstr(&buf, ref->name);
@@ -968,7 +1137,7 @@ static int push_refs_with_export(struct transport *transport,
 	set_common_push_options(transport, data->name, flags);
 	if (flags & TRANSPORT_PUSH_FORCE) {
 		if (set_helper_option(transport, "force", "true") != 0)
-			warning(_("helper %s does not support 'force'"), data->name);
+			warning(_("helper %s does not support '--force'"), data->name);
 	}
 
 	helper = get_helper(transport);
@@ -980,7 +1149,7 @@ static int push_refs_with_export(struct transport *transport,
 		struct object_id oid;
 
 		private = apply_refspecs(&data->rs, ref->name);
-		if (private && !get_oid(private, &oid)) {
+		if (private && !repo_get_oid(the_repository, private, &oid)) {
 			strbuf_addf(&buf, "^%s", private);
 			string_list_append_nodup(&revlist_args,
 						 strbuf_detach(&buf, NULL));
@@ -995,9 +1164,11 @@ static int push_refs_with_export(struct transport *transport,
 					int flag;
 
 					/* Follow symbolic refs (mainly for HEAD). */
-					name = resolve_ref_unsafe(ref->peer_ref->name,
-								  RESOLVE_REF_READING,
-								  &oid, &flag);
+					name = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
+								       ref->peer_ref->name,
+								       RESOLVE_REF_READING,
+								       &oid,
+								       &flag);
 					if (!name || !(flag & REF_ISSYMREF))
 						name = ref->peer_ref->name;
 
@@ -1026,7 +1197,9 @@ static int push_refs_with_export(struct transport *transport,
 
 	if (data->export_marks) {
 		strbuf_addf(&buf, "%s.tmp", data->export_marks);
-		rename(buf.buf, data->export_marks);
+		if (rename(buf.buf, data->export_marks))
+			warning_errno(_("could not rename '%s' to '%s'"),
+				      buf.buf, data->export_marks);
 		strbuf_release(&buf);
 	}
 
@@ -1038,15 +1211,13 @@ static int push_refs(struct transport *transport,
 {
 	struct helper_data *data = transport->data;
 
-	if (process_connect(transport, 1)) {
-		do_take_over(transport);
+	if (process_connect(transport, 1))
 		return transport->vtable->push_refs(transport, remote_refs, flags);
-	}
 
 	if (!remote_refs) {
 		fprintf(stderr,
 			_("No refs in common and none specified; doing nothing.\n"
-			  "Perhaps you should specify a branch such as 'master'.\n"));
+			  "Perhaps you should specify a branch.\n"));
 		return 0;
 	}
 
@@ -1078,14 +1249,13 @@ static int has_attribute(const char *attrs, const char *attr)
 }
 
 static struct ref *get_refs_list(struct transport *transport, int for_push,
-				 const struct argv_array *ref_prefixes)
+				 struct transport_ls_refs_options *transport_options)
 {
 	get_helper(transport);
 
-	if (process_connect(transport, for_push)) {
-		do_take_over(transport);
-		return transport->vtable->get_refs_list(transport, for_push, ref_prefixes);
-	}
+	if (process_connect(transport, for_push))
+		return transport->vtable->get_refs_list(transport, for_push,
+							transport_options);
 
 	return get_refs_list_using_list(transport, for_push);
 }
@@ -1103,10 +1273,13 @@ static struct ref *get_refs_list_using_list(struct transport *transport,
 	data->get_refs_list_called = 1;
 	helper = get_helper(transport);
 
+	if (data->object_format)
+		set_helper_option(transport, "object-format", "true");
+
 	if (data->push && for_push)
-		write_str_in_full(helper->in, "list for-push\n");
+		write_constant(helper->in, "list for-push\n");
 	else
-		write_str_in_full(helper->in, "list\n");
+		write_constant(helper->in, "list\n");
 
 	while (1) {
 		char *eov, *eon;
@@ -1115,6 +1288,17 @@ static struct ref *get_refs_list_using_list(struct transport *transport,
 
 		if (!*buf.buf)
 			break;
+		else if (buf.buf[0] == ':') {
+			const char *value;
+			if (skip_prefix(buf.buf, ":object-format ", &value)) {
+				int algo = hash_algo_by_name(value);
+				if (algo == GIT_HASH_UNKNOWN)
+					die(_("unsupported object format '%s'"),
+					    value);
+				transport->hash_algo = &hash_algos[algo];
+			}
+			continue;
+		}
 
 		eov = strchr(buf.buf, ' ');
 		if (!eov)
@@ -1127,11 +1311,11 @@ static struct ref *get_refs_list_using_list(struct transport *transport,
 		if (buf.buf[0] == '@')
 			(*tail)->symref = xstrdup(buf.buf + 1);
 		else if (buf.buf[0] != '?')
-			get_oid_hex(buf.buf, &(*tail)->old_oid);
+			get_oid_hex_algop(buf.buf, &(*tail)->old_oid, transport->hash_algo);
 		if (eon) {
 			if (has_attribute(eon + 1, "unchanged")) {
 				(*tail)->status |= REF_STATUS_UPTODATE;
-				if (read_ref((*tail)->name, &(*tail)->old_oid) < 0)
+				if (refs_read_ref(get_main_ref_store(the_repository), (*tail)->name, &(*tail)->old_oid) < 0)
 					die(_("could not read ref %s"),
 					    (*tail)->name);
 			}
@@ -1148,24 +1332,38 @@ static struct ref *get_refs_list_using_list(struct transport *transport,
 	return ret;
 }
 
+static int get_bundle_uri(struct transport *transport)
+{
+	get_helper(transport);
+
+	if (process_connect(transport, 0))
+		return transport->vtable->get_bundle_uri(transport);
+
+	return -1;
+}
+
 static struct transport_vtable vtable = {
-	set_helper_option,
-	get_refs_list,
-	fetch,
-	push_refs,
-	connect_helper,
-	release_helper
+	.set_option	= set_helper_option,
+	.get_refs_list	= get_refs_list,
+	.get_bundle_uri = get_bundle_uri,
+	.fetch_refs	= fetch_refs,
+	.fetch_object_info = fetch_object_info_helper,
+	.push_refs	= push_refs,
+	.connect	= connect_helper,
+	.disconnect	= release_helper
 };
 
 int transport_helper_init(struct transport *transport, const char *name)
 {
 	struct helper_data *data = xcalloc(1, sizeof(*data));
-	data->name = name;
+	data->name = xstrdup(name);
 
 	transport_check_allowed(name);
 
 	if (getenv("GIT_TRANSPORT_HELPER_DEBUG"))
 		debug = 1;
+
+	list_objects_filter_init(&data->transport_options.filter_options);
 
 	transport->data = data;
 	transport->vtable = &vtable;
@@ -1181,24 +1379,18 @@ int transport_helper_init(struct transport *transport, const char *name)
 /* This should be enough to hold debugging message. */
 #define PBUFFERSIZE 8192
 
+static int transfer_debug_enabled = -1;
+
 /* Print bidirectional transfer loop debug message. */
 __attribute__((format (printf, 1, 2)))
 static void transfer_debug(const char *fmt, ...)
 {
-	/*
-	 * NEEDSWORK: This function is sometimes used from multiple threads, and
-	 * we end up using debug_enabled racily. That "should not matter" since
-	 * we always write the same value, but it's still wrong. This function
-	 * is listed in .tsan-suppressions for the time being.
-	 */
-
 	va_list args;
 	char msgbuf[PBUFFERSIZE];
-	static int debug_enabled = -1;
 
-	if (debug_enabled < 0)
-		debug_enabled = getenv("GIT_TRANSLOOP_DEBUG") ? 1 : 0;
-	if (!debug_enabled)
+	if (transfer_debug_enabled < 0)
+		BUG("somebody forgot to check GIT_TRANSLOOP_DEBUG!");
+	if (!transfer_debug_enabled)
 		return;
 
 	va_start(args, fmt);
@@ -1276,7 +1468,7 @@ static int udt_do_read(struct unidirectional_transfer *t)
 		transfer_debug("%s EOF (with %i bytes in buffer)",
 			t->src_name, (int)t->bufuse);
 		t->state = SSTATE_FLUSHING;
-	} else if (bytes > 0) {
+	} else {
 		t->bufuse += bytes;
 		transfer_debug("Read %i bytes from %s (buffer now at %i)",
 			(int)bytes, t->src_name, (int)t->bufuse);
@@ -1467,6 +1659,9 @@ static int tloop_spawnwait_tasks(struct bidirectional_transfer_state *s)
 int bidirectional_transfer_loop(int input, int output)
 {
 	struct bidirectional_transfer_state state;
+
+	if (transfer_debug_enabled < 0)
+		transfer_debug_enabled = getenv("GIT_TRANSLOOP_DEBUG") ? 1 : 0;
 
 	/* Fill the state fields. */
 	state.ptg.src = input;

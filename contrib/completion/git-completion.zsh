@@ -2,26 +2,24 @@
 
 # zsh completion wrapper for git
 #
-# Copyright (c) 2012-2013 Felipe Contreras <felipe.contreras@gmail.com>
+# Copyright (c) 2012-2020 Felipe Contreras <felipe.contreras@gmail.com>
 #
-# You need git's bash completion script installed somewhere, by default it
-# would be the location bash-completion uses.
+# The recommended way to install this script is to make a copy of it as a
+# file named '_git' inside any directory in your fpath.
 #
-# If your script is somewhere else, you can configure it on your ~/.zshrc:
-#
-#  zstyle ':completion:*:*:git:*' script ~/.git-completion.zsh
-#
-# The recommended way to install this script is to make a copy of it in
-# ~/.zsh/ directory as ~/.zsh/git-completion.zsh and then add the following
-# to your ~/.zshrc file:
+# For example, create a directory '~/.zsh/', copy this file to '~/.zsh/_git',
+# and then add the following to your ~/.zshrc file:
 #
 #  fpath=(~/.zsh $fpath)
-
-complete ()
-{
-	# do nothing
-	return 0
-}
+#
+# You need git's bash completion script installed. By default bash-completion's
+# location will be used (e.g. pkg-config --variable=completionsdir bash-completion).
+#
+# If your bash completion script is somewhere else, you can specify the
+# location in your ~/.zshrc:
+#
+#  zstyle ':completion:*:*:git:*' script ~/.git-completion.bash
+#
 
 zstyle -T ':completion:*:*:git:*' tag-order && \
 	zstyle ':completion:*:*:git:*' tag-order 'common-commands'
@@ -29,18 +27,26 @@ zstyle -T ':completion:*:*:git:*' tag-order && \
 zstyle -s ":completion:*:*:git:*" script script
 if [ -z "$script" ]; then
 	local -a locations
-	local e
+	local e bash_completion
+
+	bash_completion=$(pkg-config --variable=completionsdir bash-completion 2>/dev/null) ||
+		bash_completion='/usr/share/bash-completion/completions/'
+
 	locations=(
-		$(dirname ${funcsourcetrace[1]%:*})/git-completion.bash
-		'/etc/bash_completion.d/git' # fedora, old debian
-		'/usr/share/bash-completion/completions/git' # arch, ubuntu, new debian
-		'/usr/share/bash-completion/git' # gentoo
+		"$(dirname ${funcsourcetrace[1]%:*})"/git-completion.bash
+		"$HOME/.local/share/bash-completion/completions/git"
+		"$bash_completion/git"
+		'/etc/bash_completion.d/git' # old debian
 		)
 	for e in $locations; do
 		test -f $e && script="$e" && break
 	done
 fi
+
+local old_complete="$functions[complete]"
+functions[complete]=:
 GIT_SOURCING_ZSH_COMPLETION=y . "$script"
+functions[complete]="$old_complete"
 
 __gitcomp ()
 {
@@ -51,13 +57,35 @@ __gitcomp ()
 	case "$cur_" in
 	--*=)
 		;;
+	--no-*)
+		local c IFS=$' \t\n'
+		local -a array
+		for c in ${=1}; do
+			if [[ $c == "--" ]]; then
+				continue
+			fi
+			c="$c${4-}"
+			case $c in
+			--*=|*.) ;;
+			*) c="$c " ;;
+			esac
+			array+=("$c")
+		done
+		compset -P '*[=:]'
+		compadd -Q -S '' -p "${2-}" -a -- array && _ret=0
+		;;
 	*)
 		local c IFS=$' \t\n'
 		local -a array
 		for c in ${=1}; do
+			if [[ $c == "--" ]]; then
+				c="--no-...${4-}"
+				array+=("$c ")
+				break
+			fi
 			c="$c${4-}"
 			case $c in
-			--*=*|*.) ;;
+			--*=|*.) ;;
 			*) c="$c " ;;
 			esac
 			array+=("$c")
@@ -72,44 +100,63 @@ __gitcomp_direct ()
 {
 	emulate -L zsh
 
-	local IFS=$'\n'
 	compset -P '*[=:]'
-	compadd -Q -- ${=1} && _ret=0
+	compadd -Q -S '' -- ${(f)1} && _ret=0
 }
 
 __gitcomp_nl ()
 {
 	emulate -L zsh
 
-	local IFS=$'\n'
 	compset -P '*[=:]'
-	compadd -Q -S "${4- }" -p "${2-}" -- ${=1} && _ret=0
-}
-
-__gitcomp_nl_append ()
-{
-	emulate -L zsh
-
-	local IFS=$'\n'
-	compadd -Q -S "${4- }" -p "${2-}" -- ${=1} && _ret=0
-}
-
-__gitcomp_file_direct ()
-{
-	emulate -L zsh
-
-	local IFS=$'\n'
-	compset -P '*[=:]'
-	compadd -f -- ${=1} && _ret=0
+	compadd -Q -S "${4- }" -p "${2-}" -- ${(f)1} && _ret=0
 }
 
 __gitcomp_file ()
 {
 	emulate -L zsh
 
-	local IFS=$'\n'
 	compset -P '*[=:]'
-	compadd -p "${2-}" -f -- ${=1} && _ret=0
+	compadd -f -p "${2-}" -- ${(f)1} && _ret=0
+}
+
+__gitcomp_direct_append ()
+{
+	__gitcomp_direct "$@"
+}
+
+__gitcomp_nl_append ()
+{
+	__gitcomp_nl "$@"
+}
+
+__gitcomp_file_direct ()
+{
+	__gitcomp_file "$1" ""
+}
+
+__git_complete_stashes ()
+{
+	compadd -S ' ' -- ${(f)"$(__git stash list | sed -n -e 's/:.*//p')"} && _ret=0
+}
+
+_git_zsh ()
+{
+	__gitcomp "v1.1"
+}
+
+__git_complete_command ()
+{
+	emulate -L zsh
+
+	local command="$1"
+	local completion_func="_git_${command//-/_}"
+	if (( $+functions[$completion_func] )); then
+		emulate ksh -c $completion_func
+		return 0
+	else
+		return 1
+	fi
 }
 
 __git_zsh_bash_func ()
@@ -118,14 +165,12 @@ __git_zsh_bash_func ()
 
 	local command=$1
 
-	local completion_func="_git_${command//-/_}"
-	declare -f $completion_func >/dev/null && $completion_func && return
+	__git_complete_command "$command" && return
 
 	local expansion=$(__git_aliased_command "$command")
 	if [ -n "$expansion" ]; then
 		words[1]=$expansion
-		completion_func="_git_${expansion//-/_}"
-		declare -f $completion_func >/dev/null && $completion_func
+		__git_complete_command "$expansion"
 	fi
 }
 
@@ -162,8 +207,9 @@ __git_zsh_cmd_common ()
 __git_zsh_cmd_alias ()
 {
 	local -a list
-	list=(${${${(0)"$(git config -z --get-regexp '^alias\.')"}#alias.}%$'\n'*})
-	_describe -t alias-commands 'aliases' list $* && _ret=0
+	list=(${(0)"$(git help --aliases-for-completion)"})
+	list=(${(f)"$(printf "%s:alias for '%s'\n" ${(f@)list})"})
+	_describe -t alias-commands 'aliases' list && _ret=0
 }
 
 __git_zsh_cmd_all ()
@@ -186,6 +232,7 @@ __git_zsh_main ()
 		'(-p --paginate --no-pager)'{-p,--paginate}'[pipe all output into ''less'']' \
 		'(-p --paginate)--no-pager[do not pipe git output into a pager]' \
 		'--git-dir=-[set the path to the repository]: :_directories' \
+		'*-C[run as if git was started in <path>]: :_directories' \
 		'--bare[treat the repository as a bare repository]' \
 		'(- :)--version[prints the git suite version]' \
 		'--exec-path=-[path to where your core git programs are installed]:: :_directories' \
@@ -201,13 +248,38 @@ __git_zsh_main ()
 
 	case $state in
 	(command)
-		_alternative \
-                         'alias-commands:alias:__git_zsh_cmd_alias' \
-                         'common-commands:common:__git_zsh_cmd_common' \
-                         'all-commands:all:__git_zsh_cmd_all' && _ret=0
+		_tags common-commands alias-commands all-commands
+		while _tags; do
+			_requested common-commands && __git_zsh_cmd_common
+			_requested alias-commands && __git_zsh_cmd_alias
+			_requested all-commands && __git_zsh_cmd_all
+			let _ret || break
+		done
 		;;
 	(arg)
-		local command="${words[1]}" __git_dir
+		local command="${words[1]}" __git_dir __git_cmd_idx
+		local -a __git_C_args
+		local -i i=2
+
+		while (( i <= $#orig_words )); do
+			case ${orig_words[i]} in
+			-C)
+				__git_C_args+=(-C ${orig_words[i+1]})
+				(( i++ ))
+				;;
+			-c|--git-dir|--work-tree|--namespace)
+				(( i++ ))
+				;;
+			-*)
+				;;
+			*)
+				break
+				;;
+			esac
+			(( i++ ))
+		done
+
+		__git_cmd_idx=$(( i - 1 ))
 
 		if (( $+opt_args[--bare] )); then
 			__git_dir='.'
@@ -228,6 +300,7 @@ _git ()
 {
 	local _ret=1
 	local cur cword prev
+	local __git_repo_path
 
 	cur=${words[CURRENT]}
 	prev=${words[CURRENT-1]}
@@ -235,8 +308,12 @@ _git ()
 
 	if (( $+functions[__${service}_zsh_main] )); then
 		__${service}_zsh_main
-	else
+	elif (( $+functions[__${service}_main] )); then
 		emulate ksh -c __${service}_main
+	elif (( $+functions[_${service}] )); then
+		emulate ksh -c _${service}
+	elif ((	$+functions[_${service//-/_}] )); then
+		emulate ksh -c _${service//-/_}
 	fi
 
 	let _ret && _default && _ret=0

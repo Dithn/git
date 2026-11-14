@@ -43,7 +43,16 @@ show_tool_names () {
 
 	shown_any=
 	( cd "$MERGE_TOOLS_DIR" && ls ) | {
-		while read toolname
+		while read scriptname
+		do
+			setup_tool "$scriptname" 2>/dev/null
+			# We need an actual line feed here
+			variants="$variants
+$(list_tool_variants)"
+		done
+		variants="$(echo "$variants" | sort -u)"
+
+		for toolname in $variants
 		do
 			if setup_tool "$toolname" 2>/dev/null &&
 				(eval "$condition" "$toolname")
@@ -54,7 +63,7 @@ show_tool_names () {
 					preamble=
 				fi
 				shown_any=yes
-				printf "%s%s\n" "$per_line_prefix" "$toolname"
+				printf "%s%-15s  %s\n" "$per_line_prefix" "$toolname" $(diff_mode && diff_cmd_help "$toolname" || merge_cmd_help "$toolname")
 			fi
 		done
 
@@ -88,7 +97,42 @@ merge_mode () {
 	test "$TOOL_MODE" = merge
 }
 
+get_gui_default () {
+	if diff_mode
+	then
+		GUI_DEFAULT_KEY="difftool.guiDefault"
+	else
+		GUI_DEFAULT_KEY="mergetool.guiDefault"
+	fi
+	GUI_DEFAULT_CONFIG_LCASE=$(git config --default false --get "$GUI_DEFAULT_KEY" | tr 'A-Z' 'a-z')
+	if test "$GUI_DEFAULT_CONFIG_LCASE" = "auto"
+	then
+		if test -n "$DISPLAY"
+		then
+			GUI_DEFAULT=true
+		else
+			GUI_DEFAULT=false
+		fi
+	else
+		GUI_DEFAULT=$(git config --default false --bool --get "$GUI_DEFAULT_KEY")
+		subshell_exit_status=$?
+		if test $subshell_exit_status -ne 0
+		then
+			exit $subshell_exit_status
+		fi
+	fi
+	echo $GUI_DEFAULT
+}
+
 gui_mode () {
+	if test -z "$GIT_MERGETOOL_GUI"
+	then
+		GIT_MERGETOOL_GUI=$(get_gui_default)
+		if test $? -ne 0
+		then
+			exit 2
+		fi
+	fi
 	test "$GIT_MERGETOOL_GUI" = true
 }
 
@@ -115,7 +159,7 @@ check_unchanged () {
 }
 
 valid_tool () {
-	setup_tool "$1" && return 0
+	setup_tool "$1" 2>/dev/null && return 0
 	cmd=$(get_merge_tool_cmd "$1")
 	test -n "$cmd"
 }
@@ -130,6 +174,10 @@ setup_user_tool () {
 
 	merge_cmd () {
 		( eval $merge_tool_cmd )
+	}
+
+	list_tool_variants () {
+		echo "$tool"
 	}
 }
 
@@ -149,12 +197,28 @@ setup_tool () {
 		return 1
 	}
 
+	diff_cmd_help () {
+		return 0
+	}
+
 	merge_cmd () {
 		return 1
 	}
 
+	merge_cmd_help () {
+		return 0
+	}
+
+	hide_resolved_enabled () {
+		return 0
+	}
+
 	translate_merge_tool_path () {
 		echo "$1"
+	}
+
+	list_tool_variants () {
+		echo "$tool"
 	}
 
 	# Most tools' exit codes cannot be trusted, so By default we ignore
@@ -178,18 +242,31 @@ setup_tool () {
 		false
 	}
 
-
-	if ! test -f "$MERGE_TOOLS_DIR/$tool"
+	if test -f "$MERGE_TOOLS_DIR/$tool"
 	then
+		. "$MERGE_TOOLS_DIR/$tool"
+	elif test -f "$MERGE_TOOLS_DIR/${tool%[0-9]}"
+	then
+		. "$MERGE_TOOLS_DIR/${tool%[0-9]}"
+	else
 		setup_user_tool
-		return $?
+		rc=$?
+		if test $rc -ne 0
+		then
+			echo >&2 "error: ${TOOL_MODE}tool.$tool.cmd not set for tool '$tool'"
+		fi
+		return $rc
 	fi
 
-	# Load the redefined functions
-	. "$MERGE_TOOLS_DIR/$tool"
 	# Now let the user override the default command for the tool.  If
 	# they have not done so then this will return 1 which we ignore.
 	setup_user_tool
+
+	if ! list_tool_variants | grep -q "^$tool$"
+	then
+		echo "error: unknown tool variant '$tool'" >&2
+		return 1
+	fi
 
 	if merge_mode && ! can_merge
 	then
@@ -226,6 +303,10 @@ trust_exit_code () {
 	fi
 }
 
+initialize_merge_tool () {
+	# Bring tool-specific functions into scope
+	setup_tool "$1" || return 1
+}
 
 # Entry point for running tools
 run_merge_tool () {
@@ -236,9 +317,6 @@ run_merge_tool () {
 
 	merge_tool_path=$(get_merge_tool_path "$1") || exit
 	base_present="$2"
-
-	# Bring tool-specific functions into scope
-	setup_tool "$1" || return 1
 
 	if merge_mode
 	then
@@ -286,11 +364,14 @@ list_merge_tool_candidates () {
 		tools="$tools smerge"
 	fi
 	case "${VISUAL:-$EDITOR}" in
+	*nvim*)
+		tools="$tools nvimdiff vimdiff emerge"
+		;;
 	*vim*)
-		tools="$tools vimdiff emerge"
+		tools="$tools vimdiff nvimdiff emerge"
 		;;
 	*)
-		tools="$tools emerge vimdiff"
+		tools="$tools emerge vimdiff nvimdiff"
 		;;
 	esac
 }
@@ -399,7 +480,7 @@ get_merge_tool_path () {
 	merge_tool="$1"
 	if ! valid_tool "$merge_tool"
 	then
-		echo >&2 "Unknown merge tool $merge_tool"
+		echo >&2 "Unknown $TOOL_MODE tool $merge_tool"
 		exit 1
 	fi
 	if diff_mode
@@ -427,6 +508,11 @@ get_merge_tool () {
 	is_guessed=false
 	# Check if a merge tool has been configured
 	merge_tool=$(get_configured_merge_tool)
+	subshell_exit_status=$?
+	if test $subshell_exit_status -gt "1"
+	then
+		exit $subshell_exit_status
+	fi
 	# Try to guess an appropriate merge tool if no tool has been set.
 	if test -z "$merge_tool"
 	then

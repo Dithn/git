@@ -1,8 +1,6 @@
 #ifndef COMMIT_SLAB_IMPL_H
 #define COMMIT_SLAB_IMPL_H
 
-#include "git-compat-util.h"
-
 #define implement_static_commit_slab(slabname, elemtype) \
 	implement_commit_slab(slabname, elemtype, MAYBE_UNUSED static)
 
@@ -36,6 +34,19 @@ scope void clear_ ##slabname(struct slabname *s)			\
 		free(s->slab[i]);					\
 	s->slab_count = 0;						\
 	FREE_AND_NULL(s->slab);						\
+}									\
+									\
+scope void deep_clear_ ##slabname(struct slabname *s, void (*free_fn)(elemtype *)) \
+{									\
+	unsigned int i;							\
+	for (i = 0; i < s->slab_count; i++) {				\
+		unsigned int j;						\
+		if (!s->slab[i])					\
+			continue;					\
+		for (j = 0; j < s->slab_size; j++)			\
+			free_fn(&s->slab[i][j * s->stride]);		\
+	}								\
+	clear_ ##slabname(s);						\
 }									\
 									\
 scope elemtype *slabname## _at_peek(struct slabname *s,			\

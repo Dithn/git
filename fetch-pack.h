@@ -2,9 +2,9 @@
 #define FETCH_PACK_H
 
 #include "string-list.h"
-#include "run-command.h"
 #include "protocol.h"
 #include "list-objects-filter-options.h"
+#include "oidset.h"
 
 struct oid_array;
 
@@ -19,9 +19,10 @@ struct fetch_pack_args {
 
 	/*
 	 * If not NULL, during packfile negotiation, fetch-pack will send "have"
-	 * lines only with these tips and their ancestors.
+	 * lines for all _include_ tips and then a subset of the _restrict_ tips.
 	 */
-	const struct oid_array *negotiation_tips;
+	const struct oid_array *negotiation_restrict_tips;
+	const struct oid_array *negotiation_include_tips;
 
 	unsigned deepen_relative:1;
 	unsigned quiet:1;
@@ -39,22 +40,18 @@ struct fetch_pack_args {
 	unsigned self_contained_and_connected:1;
 	unsigned cloning:1;
 	unsigned update_shallow:1;
+	unsigned reject_shallow_remote:1;
 	unsigned deepen:1;
-	unsigned from_promisor:1;
+	unsigned refetch:1;
 
 	/*
-	 * Attempt to fetch only the wanted objects, and not any objects
-	 * referred to by them. Due to protocol limitations, extraneous
-	 * objects may still be included. (When fetching non-blob
-	 * objects, only blobs are excluded; when fetching a blob, the
-	 * blob itself will still be sent. The client does not need to
-	 * know whether a wanted object is a blob or not.)
-	 *
-	 * If 1, fetch_pack() will also not modify any object flags.
-	 * This allows fetch_pack() to safely be called by any function,
-	 * regardless of which object flags it uses (if any).
+	 * Indicate that the remote of this request is a promisor remote. The
+	 * pack received does not need all referred-to objects to be present in
+	 * the local object store, and fetch-pack will store the pack received
+	 * together with a ".promisor" file indicating that the aforementioned
+	 * pack is a promisor pack.
 	 */
-	unsigned no_dependents:1;
+	unsigned from_promisor:1;
 
 	/*
 	 * Because fetch_pack() overwrites the shallow file upon a
@@ -83,13 +80,43 @@ struct ref *fetch_pack(struct fetch_pack_args *args,
 		       struct ref **sought,
 		       int nr_sought,
 		       struct oid_array *shallow,
-		       char **pack_lockfile,
+		       struct string_list *pack_lockfiles,
 		       enum protocol_version version);
+
+/*
+ * Execute the --negotiate-only mode of "git fetch", adding all known common
+ * commits to acked_commits.
+ *
+ * In the capability advertisement that has happened prior to invoking this
+ * function, the "wait-for-done" capability must be present.
+ */
+void negotiate_using_fetch(const struct oid_array *negotiation_restrict_tips,
+			   const struct string_list *server_options,
+			   int stateless_rpc,
+			   int fd[],
+			   struct oidset *acked_commits,
+			   const struct oid_array *negotiation_include_tips);
 
 /*
  * Print an appropriate error message for each sought ref that wasn't
  * matched.  Return 0 if all sought refs were matched, otherwise 1.
  */
 int report_unmatched_refs(struct ref **sought, int nr_sought);
+
+/*
+ * Return true if checks for broken objects in received pack are required.
+ */
+int fetch_pack_fsck_objects(void);
+
+/*
+ * Check if the provided config variable pertains to fetch fsck and if so append
+ * the configuration to the provided strbuf.
+ *
+ * When a fetch fsck config option is successfully processed the function
+ * returns 0. If the provided config option is unrelated to fetch fsck, 1 is
+ * returned. Errors return -1.
+ */
+int fetch_pack_fsck_config(const char *var, const char *value,
+			   struct strbuf *msg_types);
 
 #endif

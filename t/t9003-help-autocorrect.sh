@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='help.autocorrect finding a match'
+
 . ./test-lib.sh
 
 test_expect_success 'setup' '
@@ -27,26 +28,46 @@ test_expect_success 'setup' '
 	test_cmp expect actual
 '
 
-test_expect_success 'autocorrect showing candidates' '
-	git config help.autocorrect 0 &&
+for show in false no off 0 show
+do
+	test_expect_success 'autocorrect showing candidates' '
+		git config help.autocorrect $show &&
+
+		test_must_fail git lfg 2>actual &&
+		test_grep "^	lgf" actual &&
+
+		test_must_fail git distimdist 2>actual &&
+		test_grep "^	distimdistim" actual
+	'
+done
+
+for immediate in -1 immediate
+do
+	test_expect_success 'autocorrect running commands' '
+		git config help.autocorrect $immediate &&
+
+		git lfg >actual &&
+		echo "a single log entry" >expect &&
+		test_cmp expect actual &&
+
+		git distimdist >actual &&
+		echo "distimdistim was called" >expect &&
+		test_cmp expect actual
+	'
+done
+
+test_expect_success 'autocorrect can be declined altogether' '
+	git config help.autocorrect never &&
 
 	test_must_fail git lfg 2>actual &&
-	grep "^	lgf" actual &&
-
-	test_must_fail git distimdist 2>actual &&
-	grep "^	distimdistim" actual
+	test_grep "is not a git command" actual &&
+	test_line_count = 1 actual
 '
 
-test_expect_success 'autocorrect running commands' '
-	git config help.autocorrect -1 &&
-
-	git lfg >actual &&
-	echo "a single log entry" >expect &&
-	test_cmp expect actual &&
-
-	git distimdist >actual &&
-	echo "distimdistim was called" >expect &&
-	test_cmp expect actual
+test_expect_success 'autocorrect works in work tree created from bare repo' '
+	git clone --bare . bare.git &&
+	git -C bare.git worktree add ../worktree &&
+	git -C worktree -c help.autocorrect=immediate status
 '
 
 test_done

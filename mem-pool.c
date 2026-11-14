@@ -2,21 +2,46 @@
  * Memory Pool implementation logic.
  */
 
-#include "cache.h"
-#include "mem-pool.h"
+#define DISABLE_SIGN_COMPARE_WARNINGS
 
-#define BLOCK_GROWTH_SIZE 1024*1024 - sizeof(struct mp_block);
+#include "git-compat-util.h"
+#include "mem-pool.h"
+#include "gettext.h"
+
+#define BLOCK_GROWTH_SIZE (1024 * 1024 - sizeof(struct mp_block))
+
+/*
+ * The inner union is an approximation for C11's max_align_t, and the
+ * struct + offsetof computes _Alignof. This can all just be replaced
+ * with _Alignof(max_align_t) if/when C11 is part of the baseline.
+ * Note that _Alignof(X) need not be the same as sizeof(X); it's only
+ * required to be a (possibly trivial) factor. They are the same for
+ * most architectures, but m68k for example has only 2-byte alignment
+ * for its 4-byte and 8-byte types, so using sizeof would waste space.
+ *
+ * Add more types to the union if the current set is insufficient.
+ */
+struct git_max_alignment {
+	char unalign;
+	union {
+		uintmax_t max_align_uintmax;
+		void *max_align_pointer;
+	} aligned;
+};
+#define GIT_MAX_ALIGNMENT offsetof(struct git_max_alignment, aligned)
 
 /*
  * Allocate a new mp_block and insert it after the block specified in
  * `insert_after`. If `insert_after` is NULL, then insert block at the
  * head of the linked list.
  */
-static struct mp_block *mem_pool_alloc_block(struct mem_pool *mem_pool, size_t block_alloc, struct mp_block *insert_after)
+static struct mp_block *mem_pool_alloc_block(struct mem_pool *pool,
+					     size_t block_alloc,
+					     struct mp_block *insert_after)
 {
 	struct mp_block *p;
 
-	mem_pool->pool_alloc += sizeof(struct mp_block) + block_alloc;
+	pool->pool_alloc += sizeof(struct mp_block) + block_alloc;
 	p = xmalloc(st_add(sizeof(struct mp_block), block_alloc));
 
 	p->next_free = (char *)p->space;
@@ -26,35 +51,27 @@ static struct mp_block *mem_pool_alloc_block(struct mem_pool *mem_pool, size_t b
 		p->next_block = insert_after->next_block;
 		insert_after->next_block = p;
 	} else {
-		p->next_block = mem_pool->mp_block;
-		mem_pool->mp_block = p;
+		p->next_block = pool->mp_block;
+		pool->mp_block = p;
 	}
 
 	return p;
 }
 
-void mem_pool_init(struct mem_pool **mem_pool, size_t initial_size)
+void mem_pool_init(struct mem_pool *pool, size_t initial_size)
 {
-	struct mem_pool *pool;
-
-	if (*mem_pool)
-		return;
-
-	pool = xcalloc(1, sizeof(*pool));
-
+	memset(pool, 0, sizeof(*pool));
 	pool->block_alloc = BLOCK_GROWTH_SIZE;
 
 	if (initial_size > 0)
 		mem_pool_alloc_block(pool, initial_size, NULL);
-
-	*mem_pool = pool;
 }
 
-void mem_pool_discard(struct mem_pool *mem_pool, int invalidate_memory)
+void mem_pool_discard(struct mem_pool *pool, int invalidate_memory)
 {
 	struct mp_block *block, *block_to_free;
 
-	block = mem_pool->mp_block;
+	block = pool->mp_block;
 	while (block)
 	{
 		block_to_free = block;
@@ -66,27 +83,26 @@ void mem_pool_discard(struct mem_pool *mem_pool, int invalidate_memory)
 		free(block_to_free);
 	}
 
-	free(mem_pool);
+	pool->mp_block = NULL;
+	pool->pool_alloc = 0;
 }
 
-void *mem_pool_alloc(struct mem_pool *mem_pool, size_t len)
+void *mem_pool_alloc(struct mem_pool *pool, size_t len)
 {
 	struct mp_block *p = NULL;
 	void *r;
 
-	/* round up to a 'uintmax_t' alignment */
-	if (len & (sizeof(uintmax_t) - 1))
-		len += sizeof(uintmax_t) - (len & (sizeof(uintmax_t) - 1));
+	len = DIV_ROUND_UP(len, GIT_MAX_ALIGNMENT) * GIT_MAX_ALIGNMENT;
 
-	if (mem_pool->mp_block &&
-	    mem_pool->mp_block->end - mem_pool->mp_block->next_free >= len)
-		p = mem_pool->mp_block;
+	if (pool->mp_block &&
+	    pool->mp_block->end - pool->mp_block->next_free >= len)
+		p = pool->mp_block;
 
 	if (!p) {
-		if (len >= (mem_pool->block_alloc / 2))
-			return mem_pool_alloc_block(mem_pool, len, mem_pool->mp_block);
-
-		p = mem_pool_alloc_block(mem_pool, mem_pool->block_alloc, NULL);
+		if (len >= (pool->block_alloc / 2))
+			p = mem_pool_alloc_block(pool, len, pool->mp_block);
+		else
+			p = mem_pool_alloc_block(pool, pool->block_alloc, NULL);
 	}
 
 	r = p->next_free;
@@ -94,20 +110,79 @@ void *mem_pool_alloc(struct mem_pool *mem_pool, size_t len)
 	return r;
 }
 
-void *mem_pool_calloc(struct mem_pool *mem_pool, size_t count, size_t size)
+static char *mem_pool_strvfmt(struct mem_pool *pool, const char *fmt,
+			      va_list ap)
+{
+	struct mp_block *block = pool->mp_block;
+	char *next_free = block ? block->next_free : NULL;
+	size_t available = block ? block->end - block->next_free : 0;
+	va_list cp;
+	int len, len2;
+	size_t size;
+	char *ret;
+
+	va_copy(cp, ap);
+	len = vsnprintf(next_free, available, fmt, cp);
+	va_end(cp);
+	if (len < 0)
+		die(_("unable to format message: %s"), fmt);
+
+	size = st_add(len, 1); /* 1 for NUL */
+	ret = mem_pool_alloc(pool, size);
+
+	/* Shortcut; relies on mem_pool_alloc() not touching buffer contents. */
+	if (ret == next_free)
+		return ret;
+
+	len2 = vsnprintf(ret, size, fmt, ap);
+	if (len2 != len)
+		BUG("your vsnprintf is broken (returns inconsistent lengths)");
+	return ret;
+}
+
+char *mem_pool_strfmt(struct mem_pool *pool, const char *fmt, ...)
+{
+	va_list ap;
+	char *ret;
+
+	va_start(ap, fmt);
+	ret = mem_pool_strvfmt(pool, fmt, ap);
+	va_end(ap);
+	return ret;
+}
+
+void *mem_pool_calloc(struct mem_pool *pool, size_t count, size_t size)
 {
 	size_t len = st_mult(count, size);
-	void *r = mem_pool_alloc(mem_pool, len);
+	void *r = mem_pool_alloc(pool, len);
 	memset(r, 0, len);
 	return r;
 }
 
-int mem_pool_contains(struct mem_pool *mem_pool, void *mem)
+char *mem_pool_strdup(struct mem_pool *pool, const char *str)
+{
+	size_t len = strlen(str) + 1;
+	char *ret = mem_pool_alloc(pool, len);
+
+	return memcpy(ret, str, len);
+}
+
+char *mem_pool_strndup(struct mem_pool *pool, const char *str, size_t len)
+{
+	const char *p = memchr(str, '\0', len);
+	size_t actual_len = (p ? p - str : len);
+	char *ret = mem_pool_alloc(pool, actual_len+1);
+
+	ret[actual_len] = '\0';
+	return memcpy(ret, str, actual_len);
+}
+
+int mem_pool_contains(struct mem_pool *pool, void *mem)
 {
 	struct mp_block *p;
 
 	/* Check if memory is allocated in a block */
-	for (p = mem_pool->mp_block; p; p = p->next_block)
+	for (p = pool->mp_block; p; p = p->next_block)
 		if ((mem >= ((void *)p->space)) &&
 		    (mem < ((void *)p->end)))
 			return 1;

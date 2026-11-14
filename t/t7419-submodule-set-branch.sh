@@ -10,7 +10,15 @@ as expected.
 '
 
 TEST_NO_CREATE_REPO=1
+
+GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
+export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
+
 . ./test-lib.sh
+
+test_expect_success 'setup' '
+	git config --global protocol.file.allow always
+'
 
 test_expect_success 'submodule config cache setup' '
 	mkdir submodule &&
@@ -22,26 +30,28 @@ test_expect_success 'submodule config cache setup' '
 		git checkout -b topic &&
 		echo b >a &&
 		git add . &&
-		git commit -mb
+		git commit -mb &&
+		git checkout main
 	) &&
 	mkdir super &&
 	(cd super &&
 		git init &&
 		git submodule add ../submodule &&
-		git commit -m "add submodule"
+		git submodule add --name thename ../submodule thepath &&
+		git commit -m "add submodules"
 	)
 '
 
 test_expect_success 'ensure submodule branch is unset' '
 	(cd super &&
-		! grep branch .gitmodules
+		test_cmp_config "" -f .gitmodules --default "" submodule.submodule.branch
 	)
 '
 
 test_expect_success 'test submodule set-branch --branch' '
 	(cd super &&
 		git submodule set-branch --branch topic submodule &&
-		grep "branch = topic" .gitmodules &&
+		test_cmp_config topic -f .gitmodules submodule.submodule.branch &&
 		git submodule update --remote &&
 		cat <<-\EOF >expect &&
 		b
@@ -54,7 +64,7 @@ test_expect_success 'test submodule set-branch --branch' '
 test_expect_success 'test submodule set-branch --default' '
 	(cd super &&
 		git submodule set-branch --default submodule &&
-		! grep branch .gitmodules &&
+		test_cmp_config "" -f .gitmodules --default "" submodule.submodule.branch &&
 		git submodule update --remote &&
 		cat <<-\EOF >expect &&
 		a
@@ -67,7 +77,7 @@ test_expect_success 'test submodule set-branch --default' '
 test_expect_success 'test submodule set-branch -b' '
 	(cd super &&
 		git submodule set-branch -b topic submodule &&
-		grep "branch = topic" .gitmodules &&
+		test_cmp_config topic -f .gitmodules submodule.submodule.branch &&
 		git submodule update --remote &&
 		cat <<-\EOF >expect &&
 		b
@@ -80,12 +90,39 @@ test_expect_success 'test submodule set-branch -b' '
 test_expect_success 'test submodule set-branch -d' '
 	(cd super &&
 		git submodule set-branch -d submodule &&
-		! grep branch .gitmodules &&
+		test_cmp_config "" -f .gitmodules --default "" submodule.submodule.branch &&
 		git submodule update --remote &&
 		cat <<-\EOF >expect &&
 		a
 		EOF
 		git -C submodule show -s --pretty=%s >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'test submodule set-branch --branch with named submodule' '
+	(cd super &&
+		git submodule set-branch --branch topic thepath &&
+		test_cmp_config topic -f .gitmodules submodule.thename.branch &&
+		test_cmp_config "" -f .gitmodules --default "" submodule.thepath.branch &&
+		git submodule update --remote &&
+		cat <<-\EOF >expect &&
+		b
+		EOF
+		git -C thepath show -s --pretty=%s >actual &&
+		test_cmp expect actual
+	)
+'
+
+test_expect_success 'test submodule set-branch --default with named submodule' '
+	(cd super &&
+		git submodule set-branch --default thepath &&
+		test_cmp_config "" -f .gitmodules --default "" submodule.thename.branch &&
+		git submodule update --remote &&
+		cat <<-\EOF >expect &&
+		a
+		EOF
+		git -C thepath show -s --pretty=%s >actual &&
 		test_cmp expect actual
 	)
 '

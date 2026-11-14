@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 use lib (split(/:/, $ENV{GITPERLLIB}));
 
-use 5.008;
+require v5.26;
 use warnings;
 use strict;
 
@@ -23,11 +23,25 @@ sub adjust_dirsep {
 	return $path;
 }
 
+my $oid_re = qr/^[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?$/;
+
 BEGIN { use_ok('Git') }
 
 # set up
 our $abs_repo_dir = cwd();
 ok(our $r = Git->repository(Directory => "."), "open repository");
+{
+	local $ENV{GIT_TEST_ASSUME_DIFFERENT_OWNER} = 1;
+	my $failed;
+
+	$failed = eval { Git->repository(Directory => $abs_repo_dir) };
+	ok(!$failed, "reject unsafe non-bare repository");
+	like($@, qr/not a git repository/i, "unsafe error message");
+
+	$failed = eval { Git->repository(Directory => "$abs_repo_dir/bare.git") };
+	ok(!$failed, "reject unsafe bare repository");
+	like($@, qr/not a git repository/i, "unsafe error message");
+}
 
 # config
 is($r->config("test.string"), "value", "config scalar: string");
@@ -59,15 +73,15 @@ ok($@, "config_bool: non-boolean values fail");
 open STDERR, ">&", $tmpstderr or die "cannot restore STDERR";
 
 # ident
-like($r->ident("aUthor"), qr/^A U Thor <author\@example.com> [0-9]+ \+0000$/,
+like($r->ident("aUthor"), qr/^A U Thor <author\@example.com> [0-9]+ [+-]\d{4}$/,
      "ident scalar: author (type)");
-like($r->ident("cOmmitter"), qr/^C O Mitter <committer\@example.com> [0-9]+ \+0000$/,
+like($r->ident("cOmmitter"), qr/^C O Mitter <committer\@example.com> [0-9]+ [+-]\d{4}$/,
      "ident scalar: committer (type)");
 is($r->ident("invalid"), "invalid", "ident scalar: invalid ident string (no parsing)");
 my ($name, $email, $time_tz) = $r->ident('author');
 is_deeply([$name, $email], ["A U Thor", "author\@example.com"],
 	 "ident array: author");
-like($time_tz, qr/[0-9]+ \+0000/, "ident array: author");
+like($time_tz, qr/[0-9]+ [+-]\d{4}/, "ident array: author");
 is_deeply([$r->ident("Name <email> 123 +0000")], ["Name", "email", "123 +0000"],
 	  "ident array: ident string");
 is_deeply([$r->ident("invalid")], [], "ident array: invalid ident string");
@@ -93,7 +107,7 @@ is(Git::hash_object("blob", $tmpfile), $file1hash, "hash_object: roundtrip");
 open TEMPFILE, ">$tmpfile" or die "Can't open $tmpfile: $!";
 print TEMPFILE my $test_text = "test blob, to be inserted\n";
 close TEMPFILE or die "Failed writing to $tmpfile: $!";
-like(our $newhash = $r->hash_and_insert_object($tmpfile), qr/[0-9a-fA-F]{40}/,
+like(our $newhash = $r->hash_and_insert_object($tmpfile), $oid_re,
      "hash_and_insert_object: returns hash");
 open TEMPFILE, "+>$tmpfile" or die "Can't open $tmpfile: $!";
 is($r->cat_blob($newhash, \*TEMPFILE), length $test_text, "cat_blob: roundtrip size");
@@ -103,7 +117,12 @@ close TEMPFILE;
 unlink $tmpfile;
 
 # paths
-is($r->repo_path, $abs_repo_dir . "/.git", "repo_path");
+my $abs_git_dir = $abs_repo_dir . "/.git";
+if (defined $ENV{MSYSTEM} && $ENV{MSYSTEM} ne 'MSYS') {
+  $abs_git_dir = `cygpath -am "$abs_repo_dir/.git"`;
+  $abs_git_dir =~ s/\r?\n?$//;
+}
+is($r->repo_path, $abs_git_dir, "repo_path");
 is($r->wc_path, $abs_repo_dir . "/", "wc_path");
 is($r->wc_subdir, "", "wc_subdir initial");
 $r->wc_chdir("directory1");
@@ -113,13 +132,13 @@ is($r->config("test.string"), "value", "config after wc_chdir");
 # Object generation in sub directory
 chdir("directory2");
 my $r2 = Git->repository();
-is($r2->repo_path, $abs_repo_dir . "/.git", "repo_path (2)");
+is($r2->repo_path, $abs_git_dir, "repo_path (2)");
 is($r2->wc_path, $abs_repo_dir . "/", "wc_path (2)");
 is($r2->wc_subdir, "directory2/", "wc_subdir initial (2)");
 
 # commands in sub directory
 my $last_commit = $r2->command_oneline(qw(rev-parse --verify HEAD));
-like($last_commit, qr/^[0-9a-fA-F]{40}$/, 'rev-parse returned hash');
+like($last_commit, $oid_re, 'rev-parse returned hash');
 my $dir_commit = $r2->command_oneline('log', '-n1', '--pretty=format:%H', '.');
 isnt($last_commit, $dir_commit, 'log . does not show last commit');
 
@@ -132,6 +151,11 @@ is($r3->cat_blob($file1hash, \*TEMPFILE3), 15, "cat_blob(outside): size");
 close TEMPFILE3;
 unlink $tmpfile3;
 chdir($abs_repo_dir);
+
+# open alternate bare repo
+my $r4 = Git->repository(Directory => "$abs_repo_dir/bare.git");
+is($r4->command_oneline(qw(log --format=%s)), "bare commit",
+	"log of bare repo works");
 
 # unquoting paths
 is(Git::unquote_path('abc'), 'abc', 'unquote unquoted path');

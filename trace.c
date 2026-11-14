@@ -18,18 +18,24 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License
- *  along with this program; if not, see <http://www.gnu.org/licenses/>.
+ *  along with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 
-#include "cache.h"
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
+#include "abspath.h"
+#include "repository.h"
 #include "quote.h"
+#include "setup.h"
+#include "trace.h"
 
 struct trace_key trace_default_key = { "GIT_TRACE", 0, 0, 0 };
 struct trace_key trace_perf_key = TRACE_KEY_INIT(PERFORMANCE);
 struct trace_key trace_setup_key = TRACE_KEY_INIT(SETUP);
 
 /* Get a trace file descriptor from "key" env variable. */
-static int get_trace_fd(struct trace_key *key)
+static int get_trace_fd(struct trace_key *key, const char *override_envvar)
 {
 	const char *trace;
 
@@ -37,7 +43,7 @@ static int get_trace_fd(struct trace_key *key)
 	if (key->initialized)
 		return key->fd;
 
-	trace = getenv(key->key);
+	trace = override_envvar ? override_envvar : getenv(key->key);
 
 	if (!trace || !strcmp(trace, "") ||
 	    !strcmp(trace, "0") || !strcasecmp(trace, "false"))
@@ -68,6 +74,18 @@ static int get_trace_fd(struct trace_key *key)
 	return key->fd;
 }
 
+void trace_override_envvar(struct trace_key *key, const char *value)
+{
+	trace_disable(key);
+	key->initialized = 0;
+
+	/*
+	 * Invoke get_trace_fd() to initialize key using the given value
+	 * instead of the value of the environment variable.
+	 */
+	get_trace_fd(key, value);
+}
+
 void trace_disable(struct trace_key *key)
 {
 	if (key->need_close)
@@ -96,23 +114,18 @@ static int prepare_trace_line(const char *file, int line,
 	gettimeofday(&tv, NULL);
 	secs = tv.tv_sec;
 	localtime_r(&secs, &tm);
-	strbuf_addf(buf, "%02d:%02d:%02d.%06ld ", tm.tm_hour, tm.tm_min,
-		    tm.tm_sec, (long) tv.tv_usec);
-
-#ifdef HAVE_VARIADIC_MACROS
-	/* print file:line */
-	strbuf_addf(buf, "%s:%d ", file, line);
+	strbuf_addf(buf, "%02d:%02d:%02d.%06ld %s:%d", tm.tm_hour, tm.tm_min,
+		    tm.tm_sec, (long) tv.tv_usec, file, line);
 	/* align trace output (column 40 catches most files names in git) */
 	while (buf->len < 40)
 		strbuf_addch(buf, ' ');
-#endif
 
 	return 1;
 }
 
 static void trace_write(struct trace_key *key, const void *buf, unsigned len)
 {
-	if (write_in_full(get_trace_fd(key), buf, len) < 0) {
+	if (write_in_full(get_trace_fd(key, NULL), buf, len) < 0) {
 		warning("unable to write trace for %s: %s",
 			key->key, strerror(errno));
 		trace_disable(key);
@@ -217,74 +230,6 @@ static void trace_performance_vprintf_fl(const char *file, int line,
 	strbuf_release(&buf);
 }
 
-#ifndef HAVE_VARIADIC_MACROS
-
-void trace_printf(const char *format, ...)
-{
-	va_list ap;
-	va_start(ap, format);
-	trace_vprintf_fl(NULL, 0, &trace_default_key, format, ap);
-	va_end(ap);
-}
-
-void trace_printf_key(struct trace_key *key, const char *format, ...)
-{
-	va_list ap;
-	va_start(ap, format);
-	trace_vprintf_fl(NULL, 0, key, format, ap);
-	va_end(ap);
-}
-
-void trace_argv_printf(const char **argv, const char *format, ...)
-{
-	va_list ap;
-	va_start(ap, format);
-	trace_argv_vprintf_fl(NULL, 0, argv, format, ap);
-	va_end(ap);
-}
-
-void trace_strbuf(struct trace_key *key, const struct strbuf *data)
-{
-	trace_strbuf_fl(NULL, 0, key, data);
-}
-
-void trace_performance(uint64_t nanos, const char *format, ...)
-{
-	va_list ap;
-	va_start(ap, format);
-	trace_performance_vprintf_fl(NULL, 0, nanos, format, ap);
-	va_end(ap);
-}
-
-void trace_performance_since(uint64_t start, const char *format, ...)
-{
-	va_list ap;
-	va_start(ap, format);
-	trace_performance_vprintf_fl(NULL, 0, getnanotime() - start,
-				     format, ap);
-	va_end(ap);
-}
-
-void trace_performance_leave(const char *format, ...)
-{
-	va_list ap;
-	uint64_t since;
-
-	if (perf_indent)
-		perf_indent--;
-
-	if (!format) /* Allow callers to leave without tracing anything */
-		return;
-
-	since = perf_start_times[perf_indent];
-	va_start(ap, format);
-	trace_performance_vprintf_fl(NULL, 0, getnanotime() - since,
-				     format, ap);
-	va_end(ap);
-}
-
-#else
-
 void trace_printf_key_fl(const char *file, int line, struct trace_key *key,
 			 const char *format, ...)
 {
@@ -330,9 +275,6 @@ void trace_performance_leave_fl(const char *file, int line,
 	va_end(ap);
 }
 
-#endif /* HAVE_VARIADIC_MACROS */
-
-
 static const char *quote_crnl(const char *path)
 {
 	static struct strbuf new_path = STRBUF_INIT;
@@ -355,10 +297,9 @@ static const char *quote_crnl(const char *path)
 	return new_path.buf;
 }
 
-/* FIXME: move prefix to startup_info struct and get rid of this arg */
-void trace_repo_setup(const char *prefix)
+void trace_repo_setup(struct repository *r)
 {
-	const char *git_work_tree;
+	const char *git_work_tree, *prefix = r->prefix;
 	char *cwd;
 
 	if (!trace_want(&trace_setup_key))
@@ -366,14 +307,14 @@ void trace_repo_setup(const char *prefix)
 
 	cwd = xgetcwd();
 
-	if (!(git_work_tree = get_git_work_tree()))
+	if (!(git_work_tree = repo_get_work_tree(r)))
 		git_work_tree = "(null)";
 
-	if (!prefix)
+	if (!r->prefix)
 		prefix = "(null)";
 
-	trace_printf_key(&trace_setup_key, "setup: git_dir: %s\n", quote_crnl(get_git_dir()));
-	trace_printf_key(&trace_setup_key, "setup: git_common_dir: %s\n", quote_crnl(get_git_common_dir()));
+	trace_printf_key(&trace_setup_key, "setup: git_dir: %s\n", quote_crnl(repo_get_git_dir(r)));
+	trace_printf_key(&trace_setup_key, "setup: git_common_dir: %s\n", quote_crnl(repo_get_common_dir(r)));
 	trace_printf_key(&trace_setup_key, "setup: worktree: %s\n", quote_crnl(git_work_tree));
 	trace_printf_key(&trace_setup_key, "setup: cwd: %s\n", quote_crnl(cwd));
 	trace_printf_key(&trace_setup_key, "setup: prefix: %s\n", quote_crnl(prefix));
@@ -383,7 +324,7 @@ void trace_repo_setup(const char *prefix)
 
 int trace_want(struct trace_key *key)
 {
-	return !!get_trace_fd(key);
+	return !!get_trace_fd(key, NULL);
 }
 
 #if defined(HAVE_CLOCK_GETTIME) && defined(HAVE_CLOCK_MONOTONIC)

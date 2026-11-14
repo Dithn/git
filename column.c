@@ -1,7 +1,10 @@
-#include "cache.h"
+#define DISABLE_SIGN_COMPARE_WARNINGS
+
+#include "git-compat-util.h"
 #include "config.h"
 #include "column.h"
 #include "string-list.h"
+#include "pager.h"
 #include "parse-options.h"
 #include "run-command.h"
 #include "utf8.h"
@@ -23,7 +26,7 @@ struct column_data {
 /* return length of 's' in letters, ANSI escapes stripped */
 static int item_length(const char *s)
 {
-	return utf8_strnwidth(s, -1, 1);
+	return utf8_strnwidth(s, strlen(s), 1);
 }
 
 /*
@@ -107,7 +110,7 @@ static void display_plain(const struct string_list *list,
 		printf("%s%s%s", indent, list->items[i].string, nl);
 }
 
-/* Print a cell to stdout with all necessary leading/traling space */
+/* Print a cell to stdout with all necessary leading/trailing space */
 static int display_cell(struct column_data *data, int initial_width,
 			const char *empty_cell, int x, int y)
 {
@@ -181,6 +184,8 @@ void print_columns(const struct string_list *list, unsigned int colopts,
 {
 	struct column_options nopts;
 
+	if (opts && (0 > opts->padding))
+		BUG("padding must be non-negative");
 	if (!list->nr)
 		return;
 	assert((colopts & COL_ENABLE_MASK) != COL_AUTO);
@@ -358,22 +363,24 @@ static struct child_process column_process = CHILD_PROCESS_INIT;
 
 int run_column_filter(int colopts, const struct column_options *opts)
 {
-	struct argv_array *argv;
+	struct strvec *argv;
 
+	if (opts && (0 > opts->padding))
+		BUG("padding must be non-negative");
 	if (fd_out != -1)
 		return -1;
 
 	child_process_init(&column_process);
 	argv = &column_process.args;
 
-	argv_array_push(argv, "column");
-	argv_array_pushf(argv, "--raw-mode=%d", colopts);
+	strvec_push(argv, "column");
+	strvec_pushf(argv, "--raw-mode=%d", colopts);
 	if (opts && opts->width)
-		argv_array_pushf(argv, "--width=%d", opts->width);
+		strvec_pushf(argv, "--width=%d", opts->width);
 	if (opts && opts->indent)
-		argv_array_pushf(argv, "--indent=%s", opts->indent);
+		strvec_pushf(argv, "--indent=%s", opts->indent);
 	if (opts && opts->padding)
-		argv_array_pushf(argv, "--padding=%d", opts->padding);
+		strvec_pushf(argv, "--padding=%d", opts->padding);
 
 	fflush(stdout);
 	column_process.in = -1;

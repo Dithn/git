@@ -22,7 +22,12 @@ restore_checkpoint () {
 
 verify_expect () {
 	git status --porcelain -- fileA.t fileB.t fileC.t fileD.t >actual &&
-	test_cmp expect actual
+	if test "x$1" = 'x!'
+	then
+		! test_cmp expect actual
+	else
+		test_cmp expect actual
+	fi
 }
 
 test_expect_success '--pathspec-from-file from stdin' '
@@ -131,7 +136,7 @@ test_expect_success 'quotes not compatible with --pathspec-file-nul' '
 	cat >expect <<-\EOF &&
 	 D fileA.t
 	EOF
-	test_must_fail verify_expect
+	verify_expect !
 '
 
 test_expect_success 'only touches what was listed' '
@@ -155,19 +160,19 @@ test_expect_success 'error conditions' '
 	git rm fileA.t &&
 
 	test_must_fail git reset --pathspec-from-file=list --patch 2>err &&
-	test_i18ngrep -e "--pathspec-from-file is incompatible with --patch" err &&
+	test_grep -e "options .--pathspec-from-file. and .--patch. cannot be used together" err &&
 
 	test_must_fail git reset --pathspec-from-file=list -- fileA.t 2>err &&
-	test_i18ngrep -e "--pathspec-from-file is incompatible with pathspec arguments" err &&
+	test_grep -e ".--pathspec-from-file. and pathspec arguments cannot be used together" err &&
 
 	test_must_fail git reset --pathspec-file-nul 2>err &&
-	test_i18ngrep -e "--pathspec-file-nul requires --pathspec-from-file" err &&
+	test_grep -e "the option .--pathspec-file-nul. requires .--pathspec-from-file." err &&
 
 	test_must_fail git reset --soft --pathspec-from-file=list 2>err &&
-	test_i18ngrep -e "fatal: Cannot do soft reset with paths" err &&
+	test_grep -e "fatal: Cannot do soft reset with paths" err &&
 
 	test_must_fail git reset --hard --pathspec-from-file=list 2>err &&
-	test_i18ngrep -e "fatal: Cannot do hard reset with paths" err
+	test_grep -e "fatal: Cannot do hard reset with paths" err
 '
 
 test_done

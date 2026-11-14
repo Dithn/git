@@ -1,6 +1,7 @@
 #!/bin/sh
 
 test_description='Basic subproject functionality'
+
 . ./test-lib.sh
 
 test_expect_success 'setup: create superproject' '
@@ -78,8 +79,5 @@ test_expect_success 'checkout in superproject' '
 	git checkout save &&
 	git diff-index --exit-code --raw --cached save -- sub1
 '
-
-# just interesting what happened...
-# git diff --name-status -M save master
 
 test_done

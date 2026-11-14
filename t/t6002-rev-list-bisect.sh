@@ -27,13 +27,16 @@ test_bisection_diff()
 	# Test if bisection size is close to half of list size within
 	# tolerance.
 	#
-	_bisect_err=$(expr $_list_size - $_bisection_size \* 2)
-	test "$_bisect_err" -lt 0 && _bisect_err=$(expr 0 - $_bisect_err)
-	_bisect_err=$(expr $_bisect_err / 2) ; # floor
+	_bisect_err=$(($_list_size - $_bisection_size * 2))
+	if test "$_bisect_err" -lt 0
+	then
+		_bisect_err=$((0 - $_bisect_err))
+	fi
+	_bisect_err=$(($_bisect_err / 2)) ; # floor
 
-	test_expect_success \
-	"bisection diff $_bisect_option $_head $* <= $_max_diff" \
-	'test $_bisect_err -le $_max_diff'
+	test_expect_success "bisection diff $_bisect_option $_head $* <= $_max_diff" '
+		test $_bisect_err -le $_max_diff
+	'
 }
 
 date >path0
@@ -261,6 +264,56 @@ test_expect_success 'rev-parse --bisect can default to good/bad refs' '
 	sort <expect >expect.sorted &&
 	sort <actual >actual.sorted &&
 	test_cmp expect.sorted actual.sorted
+'
+
+test_output_expect_success '--bisect --first-parent' 'git rev-list --bisect --first-parent E ^F' <<EOF
+e4
+EOF
+
+test_output_expect_success '--first-parent' 'git rev-list --first-parent E ^F' <<EOF
+E
+e1
+e2
+e3
+e4
+e5
+e6
+e7
+e8
+EOF
+
+test_output_expect_success '--bisect-vars --first-parent' 'git rev-list --bisect-vars --first-parent E ^F' <<EOF
+bisect_rev='e5'
+bisect_nr=4
+bisect_good=4
+bisect_bad=3
+bisect_all=9
+bisect_steps=2
+EOF
+
+test_expect_success '--bisect-all --first-parent' '
+	cat >expect.unsorted <<-EOF &&
+	$(git rev-parse E) (tag: E, dist=0)
+	$(git rev-parse e1) (tag: e1, dist=1)
+	$(git rev-parse e2) (tag: e2, dist=2)
+	$(git rev-parse e3) (tag: e3, dist=3)
+	$(git rev-parse e4) (tag: e4, dist=4)
+	$(git rev-parse e5) (tag: e5, dist=4)
+	$(git rev-parse e6) (tag: e6, dist=3)
+	$(git rev-parse e7) (tag: e7, dist=2)
+	$(git rev-parse e8) (tag: e8, dist=1)
+	EOF
+
+	# expect results to be ordered by distance (descending),
+	# commit hash (ascending)
+	sort -k4,4r -k1,1 expect.unsorted >expect &&
+	git rev-list --bisect-all --first-parent E ^F >actual &&
+	test_cmp expect actual
+'
+
+test_expect_success '--bisect without any revisions' '
+	git rev-list --bisect HEAD..HEAD >out &&
+	test_must_be_empty out
 '
 
 test_done

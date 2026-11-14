@@ -5,11 +5,12 @@ test_description='adding and checking out large blobs'
 
 . ./test-lib.sh
 
-# This should be moved to test-lib.sh together with the
-# copy in t0021 after both topics have graduated to 'master'.
-file_size () {
-	test-tool path-utils file-size "$1"
-}
+test_expect_success 'core.bigFileThreshold must be non-negative' '
+	: >input &&
+	test_must_fail git -c core.bigFileThreshold=-1 hash-object input >out 2>err &&
+	test_grep "bad numeric config value" err &&
+	test_must_be_empty out
+'
 
 test_expect_success setup '
 	# clone does not allow us to pass core.bigfilethreshold to
@@ -23,13 +24,21 @@ test_expect_success setup '
 	export GIT_ALLOC_LIMIT
 '
 
+test_expect_success 'enter "large" codepath, with small core.bigFileThreshold' '
+	test_when_finished "rm -rf repo" &&
+
+	git init --bare repo &&
+	echo large | git -C repo hash-object -w --stdin &&
+	git -C repo -c core.bigfilethreshold=4 fsck
+'
+
 # add a large file with different settings
 while read expect config
 do
 	test_expect_success "add with $config" '
 		test_when_finished "rm -f .git/objects/pack/pack-*.* .git/index" &&
 		git $config add large1 &&
-		sz=$(file_size .git/objects/pack/pack-*.pack) &&
+		sz=$(test_file_size .git/objects/pack/pack-*.pack) &&
 		case "$expect" in
 		small) test "$sz" -le 100000 ;;
 		large) test "$sz" -ge 100000 ;;
@@ -49,43 +58,50 @@ EOF
 test_expect_success 'add a large file or two' '
 	git add large1 huge large2 &&
 	# make sure we got a single packfile and no loose objects
-	bad= count=0 idx= &&
+	count=0 idx= &&
 	for p in .git/objects/pack/pack-*.pack
 	do
-		count=$(( $count + 1 ))
-		if test_path_is_file "$p" &&
-		   idx=${p%.pack}.idx && test_path_is_file "$idx"
-		then
-			continue
-		fi
-		bad=t
+		count=$(( $count + 1 )) &&
+		test_path_is_file "$p" &&
+		idx=${p%.pack}.idx &&
+		test_path_is_file "$idx" || return 1
 	done &&
-	test -z "$bad" &&
 	test $count = 1 &&
 	cnt=$(git show-index <"$idx" | wc -l) &&
 	test $cnt = 2 &&
-	for l in .git/objects/??/??????????????????????????????????????
+	for l in .git/objects/$OIDPATH_REGEX
 	do
-		test_path_is_file "$l" || continue
-		bad=t
+		test_path_is_missing "$l" || return 1
 	done &&
-	test -z "$bad" &&
 
 	# attempt to add another copy of the same
 	git add large3 &&
 	bad= count=0 &&
 	for p in .git/objects/pack/pack-*.pack
 	do
-		count=$(( $count + 1 ))
-		if test_path_is_file "$p" &&
-		   idx=${p%.pack}.idx && test_path_is_file "$idx"
-		then
-			continue
-		fi
-		bad=t
+		count=$(( $count + 1 )) &&
+		test_path_is_file "$p" &&
+		idx=${p%.pack}.idx &&
+		test_path_is_file "$idx" || return 1
 	done &&
-	test -z "$bad" &&
 	test $count = 1
+'
+
+test_expect_success 'add large file with loose object in batch fsync' '
+	test_when_finished "rm -rf batch" &&
+	git init batch &&
+	(
+		cd batch &&
+		git config core.bigFileThreshold 5 &&
+		echo foo >1-small &&
+		echo foobar >2-large &&
+
+		git -c core.fsync=loose-object -c core.fsyncMethod=batch \
+			add 1-small 2-large &&
+
+		git cat-file -e :1-small &&
+		git cat-file -e :2-large
+	)
 '
 
 test_expect_success 'checkout a large file' '
@@ -105,15 +121,15 @@ test_expect_success 'packsize limit' '
 		# mid1 and mid2 will fit within 256k limit but
 		# appending mid3 will bust the limit and will
 		# result in a separate packfile.
-		test-tool genrandom "a" $(( 66 * 1024 )) >mid1 &&
-		test-tool genrandom "b" $(( 80 * 1024 )) >mid2 &&
-		test-tool genrandom "c" $(( 128 * 1024 )) >mid3 &&
+		test-tool genrandom "a" 66k >mid1 &&
+		test-tool genrandom "b" 80k >mid2 &&
+		test-tool genrandom "c" 128k >mid3 &&
 		git add mid1 mid2 mid3 &&
 
 		count=0 &&
 		for pi in .git/objects/pack/pack-*.idx
 		do
-			test_path_is_file "$pi" && count=$(( $count + 1 ))
+			test_path_is_file "$pi" && count=$(( $count + 1 )) || return 1
 		done &&
 		test $count = 2 &&
 
@@ -126,7 +142,7 @@ test_expect_success 'packsize limit' '
 
 		for pi in .git/objects/pack/pack-*.idx
 		do
-			git show-index <"$pi"
+			git show-index <"$pi" || return 1
 		done |
 		sed -e "s/^[0-9]* \([0-9a-f]*\) .*/\1/" |
 		sort >actual &&
@@ -149,12 +165,12 @@ test_expect_success 'diff --stat' '
 
 test_expect_success 'diff' '
 	git diff HEAD^ HEAD >actual &&
-	grep "Binary files.*differ" actual
+	test_grep "Binary files.*differ" actual
 '
 
 test_expect_success 'diff --cached' '
 	git diff --cached HEAD^ >actual &&
-	grep "Binary files.*differ" actual
+	test_grep "Binary files.*differ" actual
 '
 
 test_expect_success 'hash-object' '
@@ -177,7 +193,8 @@ test_expect_success 'git-show a large file' '
 
 test_expect_success 'index-pack' '
 	git clone file://"$(pwd)"/.git foo &&
-	GIT_DIR=non-existent git index-pack --strict --verify foo/.git/objects/pack/*.pack
+	GIT_DIR=non-existent git index-pack --object-format=$(test_oid algo) \
+		--strict --verify foo/.git/objects/pack/*.pack
 '
 
 test_expect_success 'repack' '

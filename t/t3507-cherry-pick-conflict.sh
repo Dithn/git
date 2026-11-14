@@ -9,6 +9,10 @@ test_description='test cherry-pick and revert with conflicts
 
 '
 
+GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME=main
+export GIT_TEST_DEFAULT_INITIAL_BRANCH_NAME
+
+TEST_CREATE_REPO_NO_TEMPLATE=1
 . ./test-lib.sh
 
 pristine_detach () {
@@ -29,8 +33,8 @@ test_expect_success setup '
 	test_commit redundant-pick foo c redundant &&
 	git commit --allow-empty --allow-empty-message &&
 	git tag empty &&
-	git checkout master &&
-	git config advice.detachedhead false
+	git checkout main &&
+	git config set advice.detachedhead false
 
 '
 
@@ -44,20 +48,24 @@ test_expect_success 'failed cherry-pick does not advance HEAD' '
 	test "$head" = "$newhead"
 '
 
-test_expect_success 'advice from failed cherry-pick' "
+test_expect_success 'advice from failed cherry-pick' '
 	pristine_detach initial &&
 
-	picked=\$(git rev-parse --short picked) &&
+	picked=$(git rev-parse --short picked) &&
 	cat <<-EOF >expected &&
-	error: could not apply \$picked... picked
-	hint: after resolving the conflicts, mark the corrected paths
-	hint: with 'git add <paths>' or 'git rm <paths>'
-	hint: and commit the result with 'git commit'
+	error: could not apply $picked... picked
+	hint: After resolving the conflicts, mark them with
+	hint: "git add/rm <pathspec>", then run
+	hint: "git cherry-pick --continue".
+	hint: You can instead skip this commit with "git cherry-pick --skip".
+	hint: To abort and get back to the state before "git cherry-pick",
+	hint: run "git cherry-pick --abort".
+	hint: Disable this message with "git config set --global advice.mergeConflict false"
 	EOF
 	test_must_fail git cherry-pick picked 2>actual &&
 
-	test_i18ncmp expected actual
-"
+	test_cmp expected actual
+'
 
 test_expect_success 'advice from failed cherry-pick --no-commit' "
 	pristine_detach initial &&
@@ -67,10 +75,12 @@ test_expect_success 'advice from failed cherry-pick --no-commit' "
 	error: could not apply \$picked... picked
 	hint: after resolving the conflicts, mark the corrected paths
 	hint: with 'git add <paths>' or 'git rm <paths>'
+	hint: Disable this message with \"git config set --global advice.mergeConflict false\"
 	EOF
 	test_must_fail git cherry-pick --no-commit picked 2>actual &&
 
-	test_i18ncmp expected actual
+	test_cmp expected actual &&
+	test_ref_missing CHERRY_PICK_HEAD
 "
 
 test_expect_success 'failed cherry-pick sets CHERRY_PICK_HEAD' '
@@ -170,7 +180,7 @@ test_expect_success 'partial commit of cherry-pick fails' '
 	git add foo &&
 	test_must_fail git commit foo 2>err &&
 
-	test_i18ngrep "cannot do a partial commit during a cherry-pick." err
+	test_grep "cannot do a partial commit during a cherry-pick." err
 '
 
 test_expect_success 'commit --amend of cherry-pick fails' '
@@ -181,7 +191,7 @@ test_expect_success 'commit --amend of cherry-pick fails' '
 	git add foo &&
 	test_must_fail git commit --amend 2>err &&
 
-	test_i18ngrep "in the middle of a cherry-pick -- cannot amend." err
+	test_grep "in the middle of a cherry-pick -- cannot amend." err
 '
 
 test_expect_success 'successful final commit clears cherry-pick state' '
@@ -253,7 +263,7 @@ test_expect_success \
 
 	test_must_fail git cherry-pick picked &&
 
-	test_i18ncmp expected .git/MERGE_MSG
+	test_cmp expected .git/MERGE_MSG
 '
 
 test_expect_success \
@@ -273,7 +283,7 @@ test_expect_success \
 
 	test_must_fail git cherry-pick --cleanup=scissors picked &&
 
-	test_i18ncmp expected .git/MERGE_MSG
+	test_cmp expected .git/MERGE_MSG
 '
 
 test_expect_success 'failed cherry-pick describes conflict in work tree' '
@@ -283,12 +293,12 @@ test_expect_success 'failed cherry-pick describes conflict in work tree' '
 	a
 	=======
 	c
-	>>>>>>> objid picked
+	>>>>>>> objid (picked)
 	EOF
 
 	test_must_fail git cherry-pick picked &&
 
-	sed "s/[a-f0-9]*\.\.\./objid/" foo >actual &&
+	sed "s/[a-f0-9]* (/objid (/" foo >actual &&
 	test_cmp expected actual
 '
 
@@ -298,16 +308,16 @@ test_expect_success 'diff3 -m style' '
 	cat <<-EOF >expected &&
 	<<<<<<< HEAD
 	a
-	||||||| parent of objid picked
+	||||||| parent of objid (picked)
 	b
 	=======
 	c
-	>>>>>>> objid picked
+	>>>>>>> objid (picked)
 	EOF
 
 	test_must_fail git cherry-pick picked &&
 
-	sed "s/[a-f0-9]*\.\.\./objid/" foo >actual &&
+	sed "s/[a-f0-9]* (/objid (/" foo >actual &&
 	test_cmp expected actual
 '
 
@@ -319,7 +329,7 @@ test_expect_success 'revert also handles conflicts sanely' '
 	a
 	=======
 	b
-	>>>>>>> parent of objid picked
+	>>>>>>> parent of objid (picked)
 	EOF
 	{
 		git checkout picked -- foo &&
@@ -345,7 +355,7 @@ test_expect_success 'revert also handles conflicts sanely' '
 	test_must_fail git update-index --refresh -q &&
 	test_must_fail git diff-index --exit-code HEAD &&
 	test_cmp expected-stages actual-stages &&
-	sed "s/[a-f0-9]*\.\.\./objid/" foo >actual &&
+	sed "s/[a-f0-9]* (/objid (/" foo >actual &&
 	test_cmp expected actual
 '
 
@@ -429,16 +439,16 @@ test_expect_success 'revert conflict, diff3 -m style' '
 	cat <<-EOF >expected &&
 	<<<<<<< HEAD
 	a
-	||||||| objid picked
+	||||||| objid (picked)
 	c
 	=======
 	b
-	>>>>>>> parent of objid picked
+	>>>>>>> parent of objid (picked)
 	EOF
 
 	test_must_fail git revert picked &&
 
-	sed "s/[a-f0-9]*\.\.\./objid/" foo >actual &&
+	sed "s/[a-f0-9]* (/objid (/" foo >actual &&
 	test_cmp expected actual
 '
 
@@ -462,7 +472,7 @@ test_expect_success \
 	test_must_fail git revert picked &&
 
 	sed "s/$OID_REGEX/OBJID/" .git/MERGE_MSG >actual &&
-	test_i18ncmp expected actual
+	test_cmp expected actual
 '
 
 test_expect_success \
@@ -485,13 +495,13 @@ test_expect_success \
 	test_must_fail git revert --cleanup=scissors picked &&
 
 	sed "s/$OID_REGEX/OBJID/" .git/MERGE_MSG >actual &&
-	test_i18ncmp expected actual
+	test_cmp expected actual
 '
 
 test_expect_success 'failed cherry-pick does not forget -s' '
 	pristine_detach initial &&
 	test_must_fail git cherry-pick -s picked &&
-	test_i18ngrep -e "Signed-off-by" .git/MERGE_MSG
+	test_grep -e "Signed-off-by" .git/MERGE_MSG
 '
 
 test_expect_success 'commit after failed cherry-pick does not add duplicated -s' '
@@ -512,7 +522,7 @@ test_expect_success 'commit after failed cherry-pick adds -s at the right place'
 	Signed-off-by: C O Mitter <committer@example.com>
 	# Conflicts:
 	EOF
-	grep -e "^# Conflicts:" -e '^Signed-off-by' .git/COMMIT_EDITMSG >actual &&
+	grep -e "^# Conflicts:" -e "^Signed-off-by" .git/COMMIT_EDITMSG >actual &&
 	test_cmp expect actual &&
 
 	cat <<-\EOF >expected &&
@@ -541,7 +551,7 @@ test_expect_success 'commit --amend -s places the sign-off at the right place' '
 	Signed-off-by: C O Mitter <committer@example.com>
 	Conflicts:
 	EOF
-	grep -e "^Conflicts:" -e '^Signed-off-by' .git/COMMIT_EDITMSG >actual &&
+	grep -e "^Conflicts:" -e "^Signed-off-by" .git/COMMIT_EDITMSG >actual &&
 	test_cmp expect actual
 '
 
@@ -552,10 +562,11 @@ test_expect_success 'cherry-pick preserves sparse-checkout' '
 		echo \"/*\" >.git/info/sparse-checkout
 		git read-tree --reset -u HEAD
 		rm .git/info/sparse-checkout" &&
+	mkdir .git/info &&
 	echo /unrelated >.git/info/sparse-checkout &&
 	git read-tree --reset -u HEAD &&
 	test_must_fail git cherry-pick -Xours picked>actual &&
-	test_i18ngrep ! "Changes not staged for commit:" actual
+	test_grep ! "Changes not staged for commit:" actual
 '
 
 test_expect_success 'cherry-pick --continue remembers --keep-redundant-commits' '

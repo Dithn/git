@@ -5,8 +5,13 @@
  *
  * Copyright (C) 2005 Linus Torvalds
  */
-#include "cache.h"
+#include "git-compat-util.h"
+#include "ident.h"
 #include "config.h"
+#include "date.h"
+#include "gettext.h"
+#include "mailmap.h"
+#include "strbuf.h"
 
 static struct strbuf git_default_name = STRBUF_INIT;
 static struct strbuf git_default_email = STRBUF_INIT;
@@ -41,9 +46,9 @@ static struct passwd *xgetpwuid_self(int *is_bogus)
 	pw = getpwuid(getuid());
 	if (!pw) {
 		static struct passwd fallback;
-		fallback.pw_name = "unknown";
+		fallback.pw_name = (char *) "unknown";
 #ifndef NO_GECOS_IN_PWENT
-		fallback.pw_gecos = "Unknown";
+		fallback.pw_gecos = (char *) "Unknown";
 #endif
 		pw = &fallback;
 		if (is_bogus)
@@ -54,7 +59,7 @@ static struct passwd *xgetpwuid_self(int *is_bogus)
 
 static void copy_gecos(const struct passwd *w, struct strbuf *name)
 {
-	char *src;
+	const char *src;
 
 	/* Traditionally GECOS field had office phone numbers etc, separated
 	 * with commas.  Also & stands for capitalized form of the login name.
@@ -198,7 +203,6 @@ void reset_ident_date(void)
 static int crud(unsigned char c)
 {
 	return  c <= 32  ||
-		c == '.' ||
 		c == ',' ||
 		c == ':' ||
 		c == ';' ||
@@ -268,7 +272,7 @@ static void strbuf_addstr_without_crud(struct strbuf *sb, const char *src)
  * can still be NULL if the input line only has the name/email part
  * (e.g. reading from a reflog entry).
  */
-int split_ident_line(struct ident_split *split, const char *line, int len)
+int split_ident_line(struct ident_split *split, const char *line, size_t len)
 {
 	const char *cp;
 	size_t span;
@@ -345,26 +349,121 @@ person_only:
 	return 0;
 }
 
-static const char *env_hint =
-N_("\n"
-   "*** Please tell me who you are.\n"
-   "\n"
-   "Run\n"
-   "\n"
-   "  git config --global user.email \"you@example.com\"\n"
-   "  git config --global user.name \"Your Name\"\n"
-   "\n"
-   "to set your account\'s default identity.\n"
-   "Omit --global to set the identity only in this repository.\n"
-   "\n");
+/*
+ * Returns the difference between the new and old length of the ident line.
+ */
+static ssize_t rewrite_ident_line(const char *person, size_t len,
+				   struct strbuf *buf,
+				   struct string_list *mailmap)
+{
+	size_t namelen, maillen;
+	const char *name;
+	const char *mail;
+	struct ident_split ident;
+
+	if (split_ident_line(&ident, person, len))
+		return 0;
+
+	mail = ident.mail_begin;
+	maillen = ident.mail_end - ident.mail_begin;
+	name = ident.name_begin;
+	namelen = ident.name_end - ident.name_begin;
+
+	if (map_user(mailmap, &mail, &maillen, &name, &namelen)) {
+		struct strbuf namemail = STRBUF_INIT;
+		size_t newlen;
+
+		strbuf_addf(&namemail, "%.*s <%.*s>",
+			    (int)namelen, name, (int)maillen, mail);
+
+		strbuf_splice(buf, ident.name_begin - buf->buf,
+			      ident.mail_end - ident.name_begin + 1,
+			      namemail.buf, namemail.len);
+		newlen = namemail.len;
+
+		strbuf_release(&namemail);
+
+		return newlen - (ident.mail_end - ident.name_begin);
+	}
+
+	return 0;
+}
+
+void apply_mailmap_to_header(struct strbuf *buf, const char **header,
+			       struct string_list *mailmap)
+{
+	size_t buf_offset = 0;
+
+	if (!mailmap)
+		return;
+
+	for (;;) {
+		const char *person, *line;
+		size_t i;
+		int found_header = 0;
+
+		line = buf->buf + buf_offset;
+		if (!*line || *line == '\n')
+			return; /* End of headers */
+
+		for (i = 0; header[i]; i++)
+			if (skip_prefix(line, header[i], &person)) {
+				const char *endp = strchrnul(person, '\n');
+				found_header = 1;
+				buf_offset += endp - line;
+				buf_offset += rewrite_ident_line(person, endp - person, buf, mailmap);
+				/* Recompute endp after potential buffer reallocation */
+				endp = buf->buf + buf_offset;
+				if (*endp == '\n')
+					buf_offset++;
+				break;
+			}
+
+		if (!found_header) {
+			buf_offset = strchrnul(line, '\n') - buf->buf;
+			if (buf->buf[buf_offset] == '\n')
+				buf_offset++;
+		}
+	}
+}
+
+static void ident_env_hint(enum want_ident whose_ident)
+{
+	switch (whose_ident) {
+	case WANT_AUTHOR_IDENT:
+		fputs(_("Author identity unknown\n"), stderr);
+		break;
+	case WANT_COMMITTER_IDENT:
+		fputs(_("Committer identity unknown\n"), stderr);
+		break;
+	default:
+		break;
+	}
+
+	fputs(_("\n"
+		"*** Please tell me who you are.\n"
+		"\n"
+		"Run\n"
+		"\n"
+		"  git config --global user.email \"you@example.com\"\n"
+		"  git config --global user.name \"Your Name\"\n"
+		"\n"
+		"to set your account\'s default identity.\n"
+		"Omit --global to set the identity only in this repository.\n"
+		"\n"), stderr);
+}
 
 const char *fmt_ident(const char *name, const char *email,
 		      enum want_ident whose_ident, const char *date_str, int flag)
 {
-	static struct strbuf ident = STRBUF_INIT;
+	static int index;
+	static struct strbuf ident_pool[2] = { STRBUF_INIT, STRBUF_INIT };
 	int strict = (flag & IDENT_STRICT);
 	int want_date = !(flag & IDENT_NO_DATE);
 	int want_name = !(flag & IDENT_NO_NAME);
+
+	struct strbuf *ident = &ident_pool[index];
+	index = (index + 1) % ARRAY_SIZE(ident_pool);
 
 	if (!email) {
 		if (whose_ident == WANT_AUTHOR_IDENT && git_author_email.len)
@@ -375,12 +474,12 @@ const char *fmt_ident(const char *name, const char *email,
 	if (!email) {
 		if (strict && ident_use_config_only
 		    && !(ident_config_given & IDENT_MAIL_GIVEN)) {
-			fputs(_(env_hint), stderr);
+			ident_env_hint(whose_ident);
 			die(_("no email was given and auto-detection is disabled"));
 		}
 		email = ident_default_email();
 		if (strict && default_email_is_bogus) {
-			fputs(_(env_hint), stderr);
+			ident_env_hint(whose_ident);
 			die(_("unable to auto-detect email address (got '%s')"), email);
 		}
 	}
@@ -397,13 +496,13 @@ const char *fmt_ident(const char *name, const char *email,
 		if (!name) {
 			if (strict && ident_use_config_only
 			    && !(ident_config_given & IDENT_NAME_GIVEN)) {
-				fputs(_(env_hint), stderr);
+				ident_env_hint(whose_ident);
 				die(_("no name was given and auto-detection is disabled"));
 			}
 			name = ident_default_name();
 			using_default = 1;
 			if (strict && default_name_is_bogus) {
-				fputs(_(env_hint), stderr);
+				ident_env_hint(whose_ident);
 				die(_("unable to auto-detect name (got '%s')"), name);
 			}
 		}
@@ -411,7 +510,7 @@ const char *fmt_ident(const char *name, const char *email,
 			struct passwd *pw;
 			if (strict) {
 				if (using_default)
-					fputs(_(env_hint), stderr);
+					ident_env_hint(whose_ident);
 				die(_("empty ident name (for <%s>) not allowed"), email);
 			}
 			pw = xgetpwuid_self(NULL);
@@ -421,25 +520,25 @@ const char *fmt_ident(const char *name, const char *email,
 			die(_("name consists only of disallowed characters: %s"), name);
 	}
 
-	strbuf_reset(&ident);
+	strbuf_reset(ident);
 	if (want_name) {
-		strbuf_addstr_without_crud(&ident, name);
-		strbuf_addstr(&ident, " <");
+		strbuf_addstr_without_crud(ident, name);
+		strbuf_addstr(ident, " <");
 	}
-	strbuf_addstr_without_crud(&ident, email);
+	strbuf_addstr_without_crud(ident, email);
 	if (want_name)
-			strbuf_addch(&ident, '>');
+		strbuf_addch(ident, '>');
 	if (want_date) {
-		strbuf_addch(&ident, ' ');
+		strbuf_addch(ident, ' ');
 		if (date_str && date_str[0]) {
-			if (parse_date(date_str, &ident) < 0)
+			if (parse_date(date_str, ident) < 0)
 				die(_("invalid date format: %s"), date_str);
 		}
 		else
-			strbuf_addstr(&ident, ident_default_date());
+			strbuf_addstr(ident, ident_default_date());
 	}
 
-	return ident.buf;
+	return ident->buf;
 }
 
 const char *fmt_name(enum want_ident whose_ident)
@@ -501,11 +600,6 @@ static int ident_is_sufficient(int user_ident_explicitly_given)
 int committer_ident_sufficiently_given(void)
 {
 	return ident_is_sufficient(committer_ident_explicitly_given);
-}
-
-int author_ident_sufficiently_given(void)
-{
-	return ident_is_sufficient(author_ident_explicitly_given);
 }
 
 static int set_ident(const char *var, const char *value)
@@ -575,7 +669,9 @@ static int set_ident(const char *var, const char *value)
 	return 0;
 }
 
-int git_ident_config(const char *var, const char *value, void *data)
+int git_ident_config(const char *var, const char *value,
+		     const struct config_context *ctx UNUSED,
+		     void *data UNUSED)
 {
 	if (!strcmp(var, "user.useconfigonly")) {
 		ident_use_config_only = git_config_bool(var, value);

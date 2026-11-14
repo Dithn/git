@@ -25,7 +25,7 @@ test_expect_success 'checkout --no-overlay removing last file from directory' '
 
 test_expect_success 'checkout -p --overlay is disallowed' '
 	test_must_fail git checkout -p --overlay HEAD 2>actual &&
-	test_i18ngrep "fatal: -p and --overlay are mutually exclusive" actual
+	test_grep "fatal: options .-p. and .--overlay. cannot be used together" actual
 '
 
 test_expect_success '--no-overlay --theirs with D/F conflict deletes file' '
@@ -42,6 +42,18 @@ test_expect_success '--no-overlay --theirs with D/F conflict deletes file' '
 	test_path_is_file file1 &&
 	git checkout --theirs --no-overlay -- file1 &&
 	test_path_is_missing file1
+'
+
+test_expect_success 'wildcard pathspec matches file in subdirectory' '
+	git reset --hard &&
+	mkdir subdir &&
+	test_commit file3-1 subdir/file3 &&
+	test_commit file3-2 subdir/file3 &&
+
+	git checkout --no-overlay file3-1 "*file3" &&
+	echo file3-1 >expect &&
+	test_path_is_file subdir/file3 &&
+	test_cmp expect subdir/file3
 '
 
 test_done

@@ -5,10 +5,10 @@
 
 test_description='git apply submodule tests'
 
+
 . ./test-lib.sh
 
 test_expect_success setup '
-	test_oid_init &&
 	cat > create-sm.patch <<EOF &&
 diff --git a/dir/sm b/dir/sm
 new file mode 160000
